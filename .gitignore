@@ -1,0 +1,71 @@
+# Dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# Build outputs
+.next/
+out/
+build/
+dist/
+
+# Environment files (secrets)
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Python virtual env
+scripts/python/__pycache__/
+scripts/python/*.pyc
+scripts/python/venv/
+scripts/python/.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# Playwright
+.pytest_cache/
+playwright-report/
+test-results/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Session/token files
+scripts/python/riot_session.json
+scripts/riot_session.json
+scripts/python/riot_version.json
+scripts/riot_version.json
+accounts.txt
+
+# Credentials
+*.json
+!package.json
+!tsconfig.json
+!postcss.config.js
+!tailwind.config.js
+!next.config.js
+!.eslintrc.json
+
+# Google Sheets creds
+credentials.json

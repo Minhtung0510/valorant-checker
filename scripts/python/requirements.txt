@@ -1,0 +1,6 @@
+playwright
+httpx
+gspread
+google-auth
+python-dotenv
+loguru
