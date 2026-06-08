@@ -21,22 +21,7 @@ BUG #2 — Lock file is CLASS-level shared, but a new Lock() is passed per-call
            lock entirely.
 
 ────────────────────────────────────────────────────────────────────────────────────
-BUG #3 — accounts.txt parsing BREAKS passwords with colons
-  Location: main.py, _main(), line ~1347
-  Impact:  CRITICAL — passwords containing ':' are silently corrupted
-  Status:  Not fixed
-  Detail:  `pw, region = rest.split(":", 1)` is correct (maxsplit=1), BUT the
-           line just above: `parts = line.split(":", 1)` splits username from
-           the rest. Then the REST has `password[:region]`. The `split(":", 1)`
-           on rest is fine. However if a line is:
-             `user:pass:region`  → password="pass", region="region" ✓
-             `user:p@ss:word`   → password="p@ss", region="word" ✓
-           BUT if password contains multiple colons (e.g. `user:a:b:c`):
-             password="a", region="b:c" ✗ — password truncated to "a"
-           No error is raised. Fix: use `rest.split(":", 1)` consistently.
-
-────────────────────────────────────────────────────────────────────────────────────
-BUG #4 — expires_at type mismatch
+BUG #3 — expires_at type mismatch
   Location: main.py, lockfile_tokens(), line ~271 vs _get_saved_tokens()
   Impact:  Lockfile tokens are never reused
   Status:  Not fixed
