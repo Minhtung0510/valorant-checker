@@ -1366,24 +1366,29 @@ async def _main():
 
     sem = asyncio.Semaphore(CONCURRENCY)
 
-    # BUG FIX (Bug 2): stagger start times to prevent simultaneous requests.
-    # Previously all tasks were scheduled at once, then asyncio.as_completed
-    # ran them all at the same time — triggering Riot rate limits immediately.
-    # BUG FIX (Bug 3): removed shared httpx client — each _process_one
-    # now creates its own client with its proxy.
-    async def _process_one_delayed(idx: int, acc: dict) -> Result:
-        await asyncio.sleep(idx * random.uniform(DELAY_MIN, DELAY_MAX))
-        return await _process_one(
-            username=acc["username"],
-            password=acc["password"],
-            region=acc["region"],
-            version=version,
-            proxy=acc.get("proxy", ""),
-            sem=sem,
-        )
+    # BUG FIX (Bug 2): true queue-based concurrency. Previously all tasks were
+    # created and started immediately — asyncio.as_completed just reordered results,
+    # all tasks were running in the background. Now: semaphore is acquired FIRST,
+    # then stagger delay, then actual work. This guarantees at most CONCURRENCY
+    # tasks are EVER running at the same time, and when 1 finishes the next one
+    # waits for its slot before starting, not after.
+    async def _process_one_queued(idx: int, acc: dict) -> Result:
+        await sem.acquire()  # block here until a slot opens
+        try:
+            await asyncio.sleep(idx * random.uniform(DELAY_MIN, DELAY_MAX))
+            return await _process_one(
+                username=acc["username"],
+                password=acc["password"],
+                region=acc["region"],
+                version=version,
+                proxy=acc.get("proxy", ""),
+                sem=sem,
+            )
+        finally:
+            sem.release()
 
     tasks = [
-        _process_one_delayed(idx, acc)
+        _process_one_queued(idx, acc)
         for idx, acc in enumerate(accounts)
     ]
 
