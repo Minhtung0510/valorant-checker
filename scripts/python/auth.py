@@ -49,28 +49,39 @@ _browser_instance = None
 _browser_lock = asyncio.Lock()
 
 
-async def _get_shared_browser(headless: bool):
+async def _get_shared_browser(headless: bool, timeout: float = 60.0):
     """
     Returns a shared Chromium instance. Lazily launches on first call.
     Each caller is responsible for creating their own BrowserContext.
+    Raises asyncio.TimeoutError if Chromium fails to launch within `timeout` seconds.
     """
     global _pw_instance, _browser_instance
     async with _browser_lock:
         if _browser_instance is None:
             from playwright.async_api import async_playwright
+            logger.info("  [browser] starting Chromium (this takes ~10-30s on first run)...")
             _pw_instance = await async_playwright().start()
             # NOTE: --no-sandbox and --disable-gpu are Linux/Docker flags.
             # On Windows they cause instant Chromium crashes. Removed.
-            _browser_instance = await _pw_instance.chromium.launch(
-                headless=headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-extensions",
-                ],
-            )
-            logger.info("  [browser] shared Chromium launched")
+            try:
+                _browser_instance = await asyncio.wait_for(
+                    _pw_instance.chromium.launch(
+                        headless=headless,
+                        args=[
+                            "--disable-blink-features=AutomationControlled",
+                            "--no-first-run",
+                            "--no-default-browser-check",
+                            "--disable-extensions",
+                        ],
+                    ),
+                    timeout=timeout,
+                )
+                logger.info("  [browser] shared Chromium ready")
+            except asyncio.TimeoutError:
+                logger.error(f"  [browser] Chromium launch timed out after {timeout}s")
+                await _pw_instance.stop()
+                _pw_instance = None
+                raise
     return _browser_instance
 
 
