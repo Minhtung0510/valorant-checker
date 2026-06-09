@@ -181,14 +181,17 @@ def _get_saved_tokens(username: str) -> dict | None:
         return None
     return tokens
 
-def _save_tokens(username: str, password: str, region: str, tokens: dict):
-    db = _load_db()
-    key = username.lower()
-    entry = db.get(key, {})
-    entry.update({"username": username, "password": password, "region": region, "tokens": tokens})
-    db[key] = entry
-    _save_db(db)
-    logger.debug(f"  [db] Saved tokens for {username}")
+async def _save_tokens(username: str, password: str, region: str, tokens: dict):
+    # BUG FIX (Bug 4): use _db_lock to prevent concurrent writes to accounts.json.
+    # Without lock: Account A reads → Account B reads → A writes → B writes → A's data lost.
+    async with _db_lock:
+        db = _load_db()
+        key = username.lower()
+        entry = db.get(key, {})
+        entry.update({"username": username, "password": password, "region": region, "tokens": tokens})
+        db[key] = entry
+        _save_db(db)
+        logger.debug(f"  [db] Saved tokens for {username}")
 
 def _remove_tokens(username: str):
     db = _load_db()
@@ -201,8 +204,14 @@ def _remove_tokens(username: str):
 # VERSION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _get_version(lock: asyncio.Lock) -> str:
+# BUG FIX: creating a new asyncio.Lock() per-call means the lock is useless.
+# Multiple concurrent accounts bypass the cache lock entirely. Use ONE module-level lock.
+_VERSION_LOCK = asyncio.Lock()
+
+
+async def _get_version(_lock: asyncio.Lock | None = None) -> str:
     """Fetch client version once, cache in file, reuse across all accounts."""
+    lock = _lock if _lock is not None else _VERSION_LOCK
     async with lock:
         try:
             if VERSION_CACHE.exists():
@@ -287,7 +296,7 @@ async def _http_login(username: str, password: str, region: str = "ap", proxy: s
     """
     import httpx
 
-    ver = await _get_version(asyncio.Lock())
+    ver = await _get_version()
     sdk = ver.split(".")[1] if "." in ver else "13.05.18"
 
     headers = {
@@ -494,10 +503,12 @@ async def _get_tokens(
     import httpx
 
     # ── Strategy 1: Lockfile (instant, shared — all accounts use same token) ──
-    if _lockfile_tokens():
-        t = _lockfile_tokens()
+    # BUG FIX: was calling _lockfile_tokens() TWICE — once for truthiness check,
+    # once to extract. Each call re-reads lockfile + spawns subprocess.
+    lockfile_result = _lockfile_tokens()
+    if lockfile_result:
         logger.debug(f"  [auth] lockfile")
-        return t["access_token"], t["entitlements_token"], t["puuid"], "lockfile"
+        return lockfile_result["access_token"], lockfile_result["entitlements_token"], lockfile_result["puuid"], "lockfile"
 
     # ── Strategy 2: Saved tokens in accounts.json ─────────────────────────
     saved = _get_saved_tokens(username)
@@ -529,46 +540,10 @@ async def _get_tokens(
             except Exception:
                 pass
 
-        # Token expired → try Riot token endpoint (no browser needed)
-        if refresh_token and access_token:
-            try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    r = await client.post(
-                        "https://auth.riotgames.com/token",
-                        headers={"Content-Type": "application/x-www-form-urlencoded"},
-                        content=f"grant_type=refresh_token&refresh_token={refresh_token}&client_id=riot-client".encode(),
-                    )
-                    if r.is_success:
-                        data = r.json()
-                        new_at = data.get("access_token", "")
-                        new_rt = data.get("refresh_token", "") or refresh_token
-                        new_exp = data.get("expires_in", 3600)
-                        if new_at:
-                            ent_resp = await client.post(
-                                "https://entitlements.auth.riotgames.com/api/token/v1",
-                                headers={"Authorization": f"Bearer {new_at}"},
-                                json={},
-                            )
-                            new_ent = ent_resp.json().get("entitlements_token", "") if ent_resp.is_success else ""
-                            user_resp = await client.get(
-                                "https://auth.riotgames.com/userinfo",
-                                headers={"Authorization": f"Bearer {new_at}"},
-                            )
-                            new_data = user_resp.json() if user_resp.is_success else {}
-                            puuid = new_data.get("sub", "") or saved_puuid
-                            new_tokens = {
-                                "access_token": new_at,
-                                "entitlements_token": new_ent,
-                                "puuid": puuid,
-                                "region": region,
-                                "expires_at": datetime.now().timestamp() + new_exp,
-                                "refresh_token": new_rt,
-                            }
-                            _save_tokens(username, password, region, new_tokens)
-                            logger.debug(f"  [auth] refresh_token OK")
-                            return new_at, new_ent, puuid, "refreshed"
-            except Exception:
-                pass
+        # BUG FIX: removed dead code — Riot RSO (riot-client flow) does NOT support
+        # OAuth refresh_token grants. The endpoint auth.riotgames.com/token with
+        # grant_type=refresh_token returns 400. This block never worked.
+        # Saved tokens expire → must re-login via HTTP or browser.
 
     # ── Strategy 3: HTTP login ───────────────────────────────────────────────
     if USE_BROWSER:
@@ -581,7 +556,7 @@ async def _get_tokens(
                 et = pw_result.get("entitlements_token", "")
                 pu = pw_result.get("puuid", "")
                 if at:
-                    _save_tokens(username, password, region, pw_result)
+                    await _save_tokens(username, password, region, pw_result)
                     return at, et, pu, "browser"
         except Exception as e:
             logger.debug(f"  [auth] Browser login failed: {e}")
@@ -604,7 +579,7 @@ async def _get_tokens(
         return None
 
     # Save for next run
-    _save_tokens(username, password, region, result)
+    await _save_tokens(username, password, region, result)
 
     return access_token, entitlements, puuid, "http_login"
 
@@ -837,6 +812,15 @@ class Result:
         return d
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# DB LOCK (Bug 4 fix)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# BUG FIX: previously _save_tokens() had no lock — 5 concurrent accounts would
+# read-modify-write accounts.json simultaneously, overwriting each other's tokens.
+_db_lock = asyncio.Lock()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # PROCESS ONE ACCOUNT
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -847,8 +831,15 @@ async def _process_one(
     version: str,
     proxy: str,
     sem: asyncio.Semaphore,
-    client: httpx.AsyncClient,
 ) -> Result:
+    # BUG FIX (Bug 3): each account gets its own httpx client with its proxy.
+    # Previously used a shared client with no proxy, so all API calls went
+    # through the machine's default IP — inconsistent with browser auth IP,
+    # triggering captchas and rate limits from Riot.
+    proxies = {}
+    if proxy:
+        proxies = {"http://": proxy, "https://": proxy}
+
     async with sem:
         t0 = time.monotonic()
         logger.debug(f"  [start] {username}")
@@ -884,17 +875,18 @@ async def _process_one(
                 error=auth_method,
             )
 
-        # ── Parallel API calls ──────────────────────────────────────────────
-        ui_task    = _fetch_userinfo(client, access_token, entitlements, version, puuid, region)
-        wl_task    = _fetch_wallet(client, access_token, entitlements, version, puuid, region)
-        mmr_task   = _fetch_mmr(client, access_token, entitlements, version, puuid, region)
-        sk_task    = _fetch_skins(client, access_token, entitlements, version, puuid, region)
-        xp_task    = _fetch_xp(client, access_token, entitlements, version, puuid, region)
-        res_task   = _fetch_restrictions(client, access_token, entitlements, version, puuid, region)
+        # ── API calls — each account gets own httpx client with proxy (Bug 3 fix) ──
+        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, proxies=proxies) as client:
+            ui_task    = _fetch_userinfo(client, access_token, entitlements, version, puuid, region)
+            wl_task    = _fetch_wallet(client, access_token, entitlements, version, puuid, region)
+            mmr_task   = _fetch_mmr(client, access_token, entitlements, version, puuid, region)
+            sk_task    = _fetch_skins(client, access_token, entitlements, version, puuid, region)
+            xp_task    = _fetch_xp(client, access_token, entitlements, version, puuid, region)
+            res_task   = _fetch_restrictions(client, access_token, entitlements, version, puuid, region)
 
-        userinfo, wallet, (tier, rr), skins, level, restrictions = await asyncio.gather(
-            ui_task, wl_task, mmr_task, sk_task, xp_task, res_task,
-        )
+            userinfo, wallet, (tier, rr), skins, level, restrictions = await asyncio.gather(
+                ui_task, wl_task, mmr_task, sk_task, xp_task, res_task,
+            )
 
         # ── Parse user info ────────────────────────────────────────────────
         game_name = userinfo.get("game_name", username.split("@")[0])
@@ -1364,7 +1356,7 @@ async def _main():
         sys.exit(1)
 
     # ── Get client version ────────────────────────────────────────────────────
-    version = await _get_version(asyncio.Lock())
+    version = await _get_version()
     logger.info(f"Riot client version: {version}")
     logger.info(f"Concurrency: {CONCURRENCY} | Accounts: {len(accounts)}")
 
@@ -1374,45 +1366,51 @@ async def _main():
 
     sem = asyncio.Semaphore(CONCURRENCY)
 
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
-        tasks = [
-            _process_one(
-                username=acc["username"],
-                password=acc["password"],
-                region=acc["region"],
-                version=version,
-                proxy=acc.get("proxy", ""),
-                sem=sem,
-                client=client,
-            )
-            for acc in accounts
-        ]
+    # BUG FIX (Bug 2): stagger start times to prevent simultaneous requests.
+    # Previously all tasks were scheduled at once, then asyncio.as_completed
+    # ran them all at the same time — triggering Riot rate limits immediately.
+    # BUG FIX (Bug 3): removed shared httpx client — each _process_one
+    # now creates its own client with its proxy.
+    async def _process_one_delayed(idx: int, acc: dict) -> Result:
+        await asyncio.sleep(idx * random.uniform(DELAY_MIN, DELAY_MAX))
+        return await _process_one(
+            username=acc["username"],
+            password=acc["password"],
+            region=acc["region"],
+            version=version,
+            proxy=acc.get("proxy", ""),
+            sem=sem,
+        )
 
-        # Process in parallel batches — collect results as they complete
-        results: list[Result] = []
-        for coro in asyncio.as_completed(tasks):
-            try:
-                r = await coro
-            except Exception as e:
-                logger.error(f"  Task exception: {e}")
-                continue
-            results.append(r)
-            # Map auth_fail results back to specific error type for reporting
-            if r.status == "auth_fail":
-                err = r.error or ""
-                if "mfa" in err:
-                    cat["mfa_required"] = cat.get("mfa_required", 0) + 1
-                elif "wrong_password" in err or "password" in err.lower():
-                    cat["wrong_password"] = cat.get("wrong_password", 0) + 1
-                elif "captcha" in err:
-                    cat["captcha_required"] = cat.get("captcha_required", 0) + 1
-                else:
-                    cat["auth_fail"] = cat.get("auth_fail", 0) + 1
+    tasks = [
+        _process_one_delayed(idx, acc)
+        for idx, acc in enumerate(accounts)
+    ]
+
+    # ── Run and collect results ────────────────────────────────────────────────
+    results: list[Result] = []
+    for coro in asyncio.as_completed(tasks):
+        try:
+            r = await coro
+        except Exception as e:
+            logger.error(f"  Task exception: {e}")
+            continue
+        results.append(r)
+
+    # ── Count categories ───────────────────────────────────────────────────────
+    for r in results:
+        if r.status == "auth_fail":
+            err = r.error or ""
+            if "mfa" in err:
+                cat["mfa_required"] = cat.get("mfa_required", 0) + 1
+            elif "wrong_password" in err or "password" in err.lower():
+                cat["wrong_password"] = cat.get("wrong_password", 0) + 1
+            elif "captcha" in err:
+                cat["captcha_required"] = cat.get("captcha_required", 0) + 1
             else:
-                cat[r.status] = cat.get(r.status, 0) + 1
-
-            # Small delay between completions to avoid hammering
-            await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+                cat["auth_fail"] = cat.get("auth_fail", 0) + 1
+        else:
+            cat[r.status] = cat.get(r.status, 0) + 1
 
     # ── Sort results: active first, then by skins ─────────────────────────────
     results.sort(key=lambda r: (r.ok, -(r.skins_count or 0)), reverse=True)

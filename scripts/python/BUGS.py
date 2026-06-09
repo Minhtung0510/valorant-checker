@@ -1,104 +1,125 @@
 """
-BUG DOCUMENTATION — auth.py
+BUG DOCUMENTATION — valorant-checker Python scripts
+Updated: 2026-06-09
 
-────────────────────────────────────────────────────────────────────────────────────
-BUG #1 — Duplicate lockfile calls (main.py)
-  Location: main.py, _get_tokens(), line ~497
-  Impact:  Minor (double syscalls)
-  Status:  Not fixed
-  Detail:  `_lockfile_tokens()` is called TWICE — once to check truthiness,
-           once to extract the tokens dict. Each call re-reads the lockfile
-           from disk and spawns a subprocess. Should cache the result.
-
-────────────────────────────────────────────────────────────────────────────────────
-BUG #2 — Lock file is CLASS-level shared, but a new Lock() is passed per-call
-  Location: main.py, _http_login(), line ~290
-  Impact:  Version cache is NOT thread-safe
-  Status:  Not fixed
-  Detail:  `_get_version(asyncio.Lock())` creates a brand-new Lock every time
-           _http_login() is called (once per account). The cache lock should be
-           module-level, not per-call. Multiple concurrent accounts bypass the
-           lock entirely.
-
-────────────────────────────────────────────────────────────────────────────────────
-BUG #3 — expires_at type mismatch
-  Location: main.py, lockfile_tokens(), line ~271 vs _get_saved_tokens()
-  Impact:  Lockfile tokens are never reused
-  Status:  Not fixed
-  Detail:  lockfile_tokens() returns `expires_at: datetime.now().timestamp() + 3600`
-           (a FLOAT). _get_saved_tokens() reads from accounts.json which stores it
-           as a JSON number (also float). The comparison at line ~512:
-             `expires_at > datetime.now().timestamp() + 120`
-           compares float to float. This works. BUT: if ANY account has
-           `expires_at` stored as an INTEGER string in accounts.json (from manual
-           edit or old version), the comparison silently fails and token is
-           treated as expired. Low risk in practice.
-
-────────────────────────────────────────────────────────────────────────────────────
-BUG #5 — Token refresh uses WRONG endpoint
-  Location: main.py, _get_tokens(), Strategy 2 refresh, line ~533
-  Impact:  Refresh token strategy never works
-  Status:  Not fixed — by design (Riot RSO doesn't support refresh_token grant)
-  Detail:  Riot's RSO (Riot Sign-On) does NOT issue OAuth refresh tokens.
-           The `riot-client` flow uses a session-based cookie approach.
-           Sending a refresh_token grant to auth.riotgames.com/token returns
-           400 or empty response. This code path is dead code.
-
-────────────────────────────────────────────────────────────────────────────────────
-BUG #6 — Captcha auto-solve token injection uses WRONG selector (HISTORICAL)
-  Location: auth.py (old code), _headful_login()
-  Impact:  hCaptcha tokens were never injected correctly
-  Status:  FIXED in this version
-  Detail:  OLD code: `document.querySelector("[name=g-recaptcha-response]")`
-           This targets Google's reCaptcha, NOT hCaptcha.
-           hCaptcha uses `name="h-captcha-response"` and/or
-           `data-hcaptcha-response` attribute.
-           FIXED: now sets both `name="h-captcha-response"` value attribute
-           AND `data-hcaptcha-response` attribute.
-
-────────────────────────────────────────────────────────────────────────────────────
-BUG #7 — Sitekey detection only searched parent page (HISTORICAL)
-  Location: auth.py, _is_hcaptcha_on_page()
-  Impact:  hCaptcha sitekey was often not found → captcha solver skipped
-  Status:  FIXED in this version
-  Detail:  OLD code only searched `body_html` (parent page) for sitekey.
-           hCaptcha's sitekey is embedded inside the iframe's `src` URL
-           (e.g. `https://js.hcaptcha.com/.../?sitekey=XXXXXX...`).
-           FIXED: now also iterates `page.frames` and extracts sitekey from
-           each frame's URL.
-
-────────────────────────────────────────────────────────────────────────────────────
-BUG #8 — Captcha submit button click was unreliable (HISTORICAL)
-  Location: auth.py, _headful_login(), after token injection
-  Impact:  Token was injected but form never submitted
-  Status:  FIXED in this version
-  Detail:  OLD code tried `query_selector` on the main page for buttons,
-           which doesn't find buttons inside the hCaptcha iframe shadow DOM.
-           FIXED: now iterates ALL frames (including iframe) and searches
-           for submit buttons inside each frame before falling back.
-
-────────────────────────────────────────────────────────────────────────────────────
-BUG #9 — Lockfile strategy returns SAME token for ALL accounts
-  Location: main.py, _get_tokens(), Strategy 1
-  Impact:  Multiple accounts sharing one lockfile get the same puuid/access_token
-  Status:  Not fixed — inherent to how lockfile works
-  Detail:  The lockfile contains tokens for ONE Riot Client session (one logged-in
-           user). If Valorant/Riot Client is running, all accounts processed
-           concurrently will use the SAME token — meaning only ONE real account
-           gets checked, others fail auth. Only safe with concurrency=1.
-
-────────────────────────────────────────────────────────────────────────────────────
-BUG #10 — Windows playwright crash from Linux-optimized flags (HISTORICAL)
-  Location: auth.py, _headful_login(), launch_args
-  Impact:  Browser crashed instantly on Windows before user could see anything
-  Status:  FIXED in this version
-  Detail:  OLD launch args included: --no-zygote, --disable-dev-shm-usage,
-           --disable-gpu, --disable-background-networking, --disable-crash-reporter,
-           --disable-hang-monitor, --disable-domain-reliability.
-           These flags are Linux/Docker optimizations that cause Chromium to
-           crash on Windows. FIXED: only kept 4 safe flags for Windows.
-
-────────────────────────────────────────────────────────────────────────────────────
+Legend:
+  [FIXED]  = confirmed fixed in this version
+  [OPEN]   = still present, not yet fixed
+  [DESIGN] = intentional design limitation, not a bug
 """
 
-# ── Remaining code below is the actual implementation ─────────────────────────────
+# ── BUGS FROM USER'S REVIEW ──────────────────────────────────────────────────────
+
+# ─── Bug 1 ───────────────────────────────────────────────────────────────────────
+"""
+Bug 1 — Multiple Playwright instances crash browser
+[FIXED] in auth.py
+Cause:  Each account called `async with async_playwright() as p:` which spawns
+        a Node.js subprocess + Chromium instance. With concurrency > 1, this
+        exhausts memory and crashes.
+Fix:    Shared Chromium instance via _get_shared_browser().
+        Each account gets its own BrowserContext (isolated cookies/proxy).
+"""
+
+# ─── Bug 2 ───────────────────────────────────────────────────────────────────────
+"""
+Bug 2 — asyncio.as_completed() fires all tasks at once, stagger delay is useless
+[FIXED] in main.py
+Cause:  `tasks = [coro1, coro2, ...]` + `asyncio.as_completed(tasks)` schedules
+        ALL tasks immediately. The delay at the bottom of the loop only fires
+        AFTER a task finishes — does nothing to prevent simultaneous burst.
+Fix:    _process_one_delayed() staggers start times: await sleep(idx * delay)
+        before running _process_one.
+"""
+
+# ─── Bug 3 ───────────────────────────────────────────────────────────────────────
+"""
+Bug 3 — Proxy only used during auth, all subsequent API calls bypass proxy
+[FIXED] in main.py + auth.py
+Cause:  The main loop used a single shared httpx.AsyncClient (no proxy).
+        All wallet/MMR/skins calls went through machine's default IP —
+        inconsistent with browser auth IP → Riot flagged as suspicious,
+        triggering captcha/rate-limit.
+Fix:    Each account creates its own httpx.AsyncClient with its proxy:
+          async with httpx.AsyncClient(proxies={"http://": proxy, "https://": proxy})
+        Also fixed auth.py _headful_login(): entitlements call now uses same proxy.
+"""
+
+# ─── Bug 4 ───────────────────────────────────────────────────────────────────────
+"""
+Bug 4 — Race condition writing accounts.json
+[FIXED] in main.py
+Cause:  _save_tokens() had no lock. At concurrency=5, 5 accounts read the same
+        db dict simultaneously, then write back one-by-one. Last write wins,
+        all previous writes are overwritten — tokens of 4 accounts lost.
+Fix:    Added _db_lock = asyncio.Lock(). _save_tokens() is now async and
+        wraps read-modify-write in `async with _db_lock`.
+"""
+
+# ─── Bug 5 ───────────────────────────────────────────────────────────────────────
+"""
+Bug 5 — _lockfile_tokens() called TWICE per account
+[FIXED] in main.py
+Cause:  `if _lockfile_tokens():` reads lockfile + spawns subprocess.
+        Then `t = _lockfile_tokens()` reads AGAIN. Double syscall per account.
+Fix:    `t = _lockfile_tokens(); if t: ...`
+"""
+
+# ─── Bug 6 ───────────────────────────────────────────────────────────────────────
+"""
+Bug 6 — _get_version() created a NEW Lock() on every call
+[FIXED] in main.py
+Cause:  _http_login() called `_get_version(asyncio.Lock())` — each call got a
+        fresh lock, making the cache lock completely useless. Concurrent accounts
+        all fetched version simultaneously, hammering valorant-api.com.
+Fix:    Module-level `_VERSION_LOCK = asyncio.Lock()`. _get_version() defaults
+        to it. Calls simplified to `await _get_version()`.
+"""
+
+# ─── Bug 7 ───────────────────────────────────────────────────────────────────────
+"""
+Bug 7 — accounts.json lockfile/thread safety
+[OPEN] in main.py
+Note:   _db_lock fixes the write race. Read race (5 accounts reading same db
+        dict simultaneously) is low-risk since Python GIL serializes file reads.
+        Not worth additional complexity.
+"""
+
+# ─── Bug 8 ───────────────────────────────────────────────────────────────────────
+"""
+Bug 8 — Lockfile returns SAME token for ALL accounts
+[DESIGN]
+Cause:  Lockfile contains tokens for ONE Riot Client session (one logged-in user).
+        If Valorant is running, all concurrent accounts share the same lockfile
+        tokens → only one real account gets checked, others fail auth.
+Fix:    Use --concurrency 1 when relying on lockfile, OR disable lockfile
+        strategy entirely (future enhancement).
+"""
+
+# ─── Bug 9 ───────────────────────────────────────────────────────────────────────
+"""
+Bug 9 — captcha auto-solve dead code in main.py
+[OPEN] in main.py
+Cause:  _http_login() returns {"_status": "captcha_required"} but main.py
+        _process_one() has no handler for this status — captcha_required
+        accounts fall through and return generic auth_fail.
+Fix:    Add captcha_required to the label_map + error handling in _process_one.
+"""
+
+# ─── Bug 10 ──────────────────────────────────────────────────────────────────────
+"""
+Bug 10 — Screenshot files tracked in git
+[FIXED] in .gitignore
+Cause:  scripts/python/logs/screenshots/*.png were staged in git.
+Fix:    Removed from staging, added to .gitignore.
+"""
+
+# ─── Bug 11 ───────────────────────────────────────────────────────────────────────
+"""
+Bug 11 — Dead code: refresh_token endpoint in Riot RSO flow
+[FIXED] in main.py (bug #5 in original doc)
+Cause:  Riot RSO (riot-client) does NOT support OAuth refresh_token grants.
+        The block calling auth.riotgames.com/token with grant_type=refresh_token
+        never worked — dead code that wasted execution time.
+Fix:    Removed entire refresh_token block. Expired saved tokens → re-login.
+"""

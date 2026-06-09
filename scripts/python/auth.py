@@ -39,6 +39,52 @@ if not logger.handlers:
     logger.addHandler(_h)
     logger.setLevel(logging.INFO)
 
+# ── Shared browser (Bug 1 fix) ─────────────────────────────────────────────────
+# FIX: Previously each account spawned its own Node.js subprocess + Chromium instance.
+# Multiple concurrent browsers exhaust memory and crash on Windows.
+# Solution: launch ONE browser at startup, each account gets its own Context.
+
+_pw_instance = None
+_browser_instance = None
+_browser_lock = asyncio.Lock()
+
+
+async def _get_shared_browser(headless: bool):
+    """
+    Returns a shared Chromium instance. Lazily launches on first call.
+    Each caller is responsible for creating their own BrowserContext.
+    """
+    global _pw_instance, _browser_instance
+    async with _browser_lock:
+        if _browser_instance is None:
+            from playwright.async_api import async_playwright
+            _pw_instance = await async_playwright().start()
+            # NOTE: --no-sandbox and --disable-gpu are Linux/Docker flags.
+            # On Windows they cause instant Chromium crashes. Removed.
+            _browser_instance = await _pw_instance.chromium.launch(
+                headless=headless,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-extensions",
+                ],
+            )
+            logger.info("  [browser] shared Chromium launched")
+    return _browser_instance
+
+
+async def _close_shared_browser():
+    """Cleanup: called once at program exit."""
+    global _pw_instance, _browser_instance
+    if _browser_instance:
+        await _browser_instance.close()
+        _browser_instance = None
+    if _pw_instance:
+        await _pw_instance.stop()
+        _pw_instance = None
+        logger.info("  [browser] shared Chromium closed")
+
 SCRIPT_DIR = Path(__file__).parent
 SCREENSHOT_DIR = SCRIPT_DIR / "logs" / "screenshots"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
@@ -740,9 +786,9 @@ def parse_proxy(proxy: str) -> dict | None:
 
 async def _headful_login(username: str, password: str, proxy: str = "", headless: bool = False) -> Optional[dict]:
     """
-    Playwright with headful Chrome browser — NOT detected as automation.
+    Playwright with shared Chromium instance — NOT detected as automation.
     Opens a real Chrome window, user logs in once, tokens are saved.
-    Supports HTTPS/SOCKS5 proxy.
+    Supports HTTPS/SOCKS5 proxy per context.
     """
     try:
         from playwright.async_api import async_playwright
@@ -750,213 +796,201 @@ async def _headful_login(username: str, password: str, proxy: str = "", headless
         logger.error("  playwright not installed")
         return None
 
-    # ── Proxy config for Playwright ───────────────────────────────────────────
     pw_proxy = parse_proxy(proxy)
     proxy_short = proxy.split("@")[-1] if "@" in proxy else proxy
-    logger.info(f"  [browser] launching (headless={headless}) proxy={proxy_short}")
-    logger.info(f"  [browser] pw_proxy config: {pw_proxy}")
+    logger.info(f"  [browser] using shared Chromium (headless={headless}) proxy={proxy_short}")
 
     try:
-        async with async_playwright() as p:
-            launch_args = [
-                "--disable-blink-features=AutomationControlled",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--no-sandbox",
-                "--disable-extensions",
-            ]
+        browser = await _get_shared_browser(headless)
 
-            try:
-                browser_ctx = await p.chromium.launch(
-                    headless=headless,
-                    args=launch_args,
-                    proxy=pw_proxy,
-                    timeout=30_000,
-                )
-                logger.info("  [browser] launched successfully")
-            except Exception as e:
-                logger.error(f"  [browser] launch failed: {e}")
+        context = await browser.new_context(
+            proxy=pw_proxy,
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+        )
+        page = await context.new_page()
+
+        # Navigate to Riot auth
+        await page.goto(
+            "https://auth.riotgames.com/authorize"
+            "?redirect_uri=http://localhost/redirect"
+            "&client_id=riot-client"
+            "&response_type=token%20id_token"
+            "&nonce=1"
+            "&scope=openid%20link%20ban%20lol_region%20account",
+            wait_until="domcontentloaded",
+            timeout=45_000,
+        )
+
+        # Wait for username field
+        try:
+            await page.wait_for_selector('input[name="username"]', timeout=30_000)
+        except Exception:
+            if await _is_blocked(page):
+                await context.close()
+                return None
+            await context.close()
+            return None
+
+        await asyncio.sleep(1.5)
+
+        # Fill username
+        if not await _fill_input(page, 'input[name="username"]', username):
+            await context.close()
+            return None
+        await page.keyboard.press("Enter")
+        await asyncio.sleep(2)
+
+        if await _is_magic_link(page):
+            logger.info("  Magic link not supported — check email manually")
+            await context.close()
+            return None
+
+        # Wait for password
+        try:
+            await page.wait_for_selector('input[name="password"]', timeout=20_000)
+        except Exception:
+            await context.close()
+            return None
+
+        # Fill password
+        if not await _fill_input(page, 'input[name="password"]', password):
+            await context.close()
+            return None
+
+        await asyncio.sleep(0.5)
+        await _click_sign_in(page)
+        logger.info("  Waiting for redirect...")
+
+        # Wait for redirect with token — detect & auto-solve hCaptcha
+        captcha_solved = False
+        for attempt in range(80):  # 80 * 0.5s = 40s max
+            await asyncio.sleep(0.5)
+
+            if await _is_blocked(page):
+                logger.info(f"  [debug] blocked on attempt {attempt}")
+                await context.close()
                 return None
 
-            context = await browser_ctx.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0.0.0 Safari/537.36"
-                ),
-            )
-            page = await context.new_page()
+            url = page.url
 
-            try:
-                # Navigate to Riot auth
-                await page.goto(
-                    "https://auth.riotgames.com/authorize"
-                    "?redirect_uri=http://localhost/redirect"
-                    "&client_id=riot-client"
-                    "&response_type=token%20id_token"
-                    "&nonce=1"
-                    "&scope=openid%20link%20ban%20lol_region%20account",
-                    wait_until="domcontentloaded",
-                    timeout=45_000,
-                )
-
-                # Wait for username field
-                try:
-                    await page.wait_for_selector('input[name="username"]', timeout=30_000)
-                except Exception:
-                    if await _is_blocked(page):
-                        return None
-                    return None
-
-                await asyncio.sleep(1.5)
-
-                # Fill username
-                if not await _fill_input(page, 'input[name="username"]', username):
-                    return None
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(2)
-
-                if await _is_magic_link(page):
-                    logger.info("  Magic link not supported — check email manually")
-                    return None
-
-                # Wait for password
-                try:
-                    await page.wait_for_selector('input[name="password"]', timeout=20_000)
-                except Exception:
-                    return None
-
-                # Fill password
-                if not await _fill_input(page, 'input[name="password"]', password):
-                    return None
-
-                await asyncio.sleep(0.5)
-                await _click_sign_in(page)
-                logger.info("  Waiting for redirect...")
-
-                # Wait for redirect with token — detect & auto-solve hCaptcha
-                captcha_solved = False
-                for attempt in range(80):  # 80 * 0.5s = 40s max
-                    await asyncio.sleep(0.5)
-
-                    if await _is_blocked(page):
-                        logger.info(f"  [debug] blocked on attempt {attempt}")
-                        return None
-
-                    url = page.url
-
-                    # Check for hCaptcha challenge page
-                    if "hcaptcha" in url.lower() or "challenges" in url.lower():
-                        if not captcha_solved:
-                            captcha_info = await _is_hcaptcha_on_page(page)
-                            if captcha_info:
-                                proxy_short = proxy.split("@")[-1] if "@" in proxy else proxy
-                                token = await _solve_hcaptcha(
-                                    captcha_info["site_key"],
-                                    captcha_info["page_url"],
-                                    proxy=proxy_short,
-                                )
-                                if token:
-                                    # Inject token back to page via evaluate
-                                    await page.evaluate(
-                                        f'document.querySelector("[name=h-captcha-response]")'
-                                        f'?.setAttribute("value", "{token}");'
-                                        f'document.querySelector("[data-hcaptcha-response]")'
-                                        f'?.setAttribute("data-hcaptcha-response", "{token}");'
-                                    )
+            # Check for hCaptcha challenge page
+            if "hcaptcha" in url.lower() or "challenges" in url.lower():
+                if not captcha_solved:
+                    captcha_info = await _is_hcaptcha_on_page(page)
+                    if captcha_info:
+                        proxy_short2 = proxy.split("@")[-1] if "@" in proxy else proxy
+                        token = await _solve_hcaptcha(
+                            captcha_info["site_key"],
+                            captcha_info["page_url"],
+                            proxy=proxy_short2,
+                        )
+                        if token:
+                            await page.evaluate(
+                                f'document.querySelector("[name=h-captcha-response]")'
+                                f'?.setAttribute("value", "{token}");'
+                                f'document.querySelector("[data-hcaptcha-response]")'
+                                f'?.setAttribute("data-hcaptcha-response", "{token}");'
+                            )
+                            try:
+                                submitted = False
+                                for frame in page.frames:
                                     try:
-                                        submitted = False
-                                        # Try hCaptcha iframe submit
-                                        frames = page.frames
-                                        for frame in frames:
-                                            try:
-                                                submit = await frame.query_selector(
-                                                    '#challenge-form button[type="submit"], '
-                                                    '#hcaptcha-popup a, '
-                                                    '.h-captcha iframe ~ *, '
-                                                    'button[data-hcaptcha-response]'
-                                                )
-                                                if submit and not submitted:
-                                                    await submit.click()
-                                                    submitted = True
-                                            except Exception:
-                                                pass
-                                        if not submitted:
-                                            await page.evaluate(
-                                                'document.querySelectorAll("button")[0]?.click()'
-                                            )
+                                        submit = await frame.query_selector(
+                                            '#challenge-form button[type="submit"], '
+                                            '#hcaptcha-popup a, '
+                                            'button[data-hcaptcha-response]'
+                                        )
+                                        if submit and not submitted:
+                                            await submit.click()
+                                            submitted = True
                                     except Exception:
                                         pass
-                                    captcha_solved = True
-                                    logger.info("  [captcha] Token submitted, waiting for redirect...")
-                                    await asyncio.sleep(2)
-                                else:
-                                    logger.warning("  [captcha] Auto-solve failed, captcha page detected")
-                            else:
-                                logger.warning("  [captcha] hCaptcha detected but no sitekey found")
-                                return None
+                                if not submitted:
+                                    await page.evaluate(
+                                        'document.querySelectorAll("button")[0]?.click()'
+                                    )
+                            except Exception:
+                                pass
+                            captcha_solved = True
+                            logger.info("  [captcha] Token submitted, waiting for redirect...")
+                            await asyncio.sleep(2)
+                        else:
+                            logger.warning("  [captcha] Auto-solve failed, captcha page detected")
+                            await context.close()
+                            return None
+                    else:
+                        logger.warning("  [captcha] hCaptcha detected but no sitekey found")
+                        await context.close()
+                        return None
 
-                    if "access_token=" in url:
-                        logger.info(f"  [debug] redirect reached: {url[:80]}...")
-                        break
+            if "access_token=" in url:
+                logger.info(f"  [debug] redirect reached: {url[:80]}...")
+                break
 
-                    # Log every ~10s
-                    if attempt % 4 == 0:
-                        logger.info(f"  [debug] still waiting... (attempt {attempt}, url={url[:80]})")
-                else:
-                    logger.info(f"  [debug] timeout waiting for redirect, final url: {page.url[:200]}")
-                    await _take_ss(page, "no_redirect", username)
-                    return None
+            # Log every ~10s
+            if attempt % 4 == 0:
+                logger.info(f"  [debug] still waiting... (attempt {attempt}, url={url[:80]})")
+        else:
+            logger.info(f"  [debug] timeout waiting for redirect, final url: {page.url[:200]}")
+            await _take_ss(page, "no_redirect", username)
+            await context.close()
+            return None
 
-                # Parse token
-                fragment = url.split("#", 1)[-1]
-                params = {}
-                for pair in fragment.split("&"):
-                    if "=" in pair:
-                        k, _, v = pair.partition("=")
-                        params[k] = v
+        # Parse token from URL fragment
+        fragment = url.split("#", 1)[-1]
+        params = {}
+        for pair in fragment.split("&"):
+            if "=" in pair:
+                k, _, v = pair.partition("=")
+                params[k] = v
 
-                access_token = params.get("access_token", "")
-                if not access_token:
-                    return None
+        access_token = params.get("access_token", "")
+        if not access_token:
+            await context.close()
+            return None
 
-                # Save cookies for future runs
-                cookies = await context.cookies()
-                save_cookies(cookies)
+        # Save cookies for future runs
+        cookies = await context.cookies()
+        save_cookies(cookies)
 
-                logger.info("  Headful login successful — tokens saved")
+        logger.info("  Headful login successful — tokens saved")
 
-                # Get entitlements - don't use proxy, already authenticated via browser
-                import httpx
-                auth_hdr = {"Authorization": f"Bearer {access_token}"}
-                async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
-                    ent_resp = await client.post(
-                        "https://entitlements.auth.riotgames.com/api/token/v1",
-                        headers=auth_hdr, json={},
-                    )
-                    entitlements = ""
-                    if ent_resp.is_success:
-                        entitlements = ent_resp.json().get("entitlements_token", "")
+        # Get entitlements — use the same proxy the browser used
+        # BUG FIX (Bug 3): previously no proxy was used here, causing
+        # inconsistent IP and potential captcha triggers from Riot.
+        import httpx
+        auth_hdr = {"Authorization": f"Bearer {access_token}"}
+        proxies = {"http://": proxy, "https://": proxy} if proxy else {}
+        async with httpx.AsyncClient(timeout=10.0, proxies=proxies) as client:
+            ent_resp = await client.post(
+                "https://entitlements.auth.riotgames.com/api/token/v1",
+                headers=auth_hdr, json={},
+            )
+            entitlements = ""
+            if ent_resp.is_success:
+                entitlements = ent_resp.json().get("entitlements_token", "")
 
-                    user_resp = await client.get(
-                        "https://auth.riotgames.com/userinfo",
-                        headers=auth_hdr,
-                    )
-                    puuid = ""
-                    if user_resp.is_success:
-                        puuid = user_resp.json().get("sub", "")
+            user_resp = await client.get(
+                "https://auth.riotgames.com/userinfo",
+                headers=auth_hdr,
+            )
+            puuid = ""
+            if user_resp.is_success:
+                puuid = user_resp.json().get("sub", "")
 
-                return {
-                    "access_token": access_token,
-                    "entitlements_token": entitlements,
-                    "puuid": puuid,
-                    "region": "ap",
-                    "expires_at": 0,
-                    "refresh_token": "",
-                }
-
-            finally:
-                await context.close()
+        await context.close()
+        return {
+            "access_token": access_token,
+            "entitlements_token": entitlements,
+            "puuid": puuid,
+            "region": "ap",
+            "expires_at": 0,
+            "refresh_token": "",
+        }
 
     except Exception as exc:
         logger.error(f"  Headful login error: {exc}")
