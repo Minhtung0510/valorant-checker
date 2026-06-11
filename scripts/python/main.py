@@ -1,90 +1,91 @@
 """
-main.py — High-performance Valorant account checker.
+main.py — Valorant Account Checker với GoLogin Integration.
 
-Optimizations:
-  • Parallel processing  — asyncio.Semaphore limits concurrency (default: 5)
-  • HTTP-only auth       — Riot Auth API (no Playwright browser)
-  • Playwright auth      — --browser flag uses real Chrome (no captcha)
-  • Persistent tokens    — accounts.json stores tokens between runs
-  • Fast retry          — token refresh is headless HTTP, ~100ms
-  • Short delays        — 0.3-1.2s between accounts (was 3-6s)
-  • hCaptcha auto-solve  — via CapSolver / Anti-Captcha / CapMonster / 2Captcha
+YÊU CẦU:
+    1. GoLogin App đã cài đặt: https://gologin.com
+    2. Tạo GoLogin profiles thủ công trong app
+    3. Mỗi profile = 1 account Valorant (đã đăng nhập Riot)
 
-Auth strategy per account:
-  1. Lockfile         → Valorant running → instant (<1s)
-  2. accounts.json    → saved tokens → headless refresh (~100ms)
-  3. HTTP login       → Riot Auth API → save tokens for next runs (~2s)
-  4. Browser login    → --browser flag uses Playwright Chrome (~5s)
+CÁCH SỬ DỤNG:
+    1. pip install -r requirements.txt
+    2. python -m playwright install chromium
+    3. Tạo GoLogin profiles trong app (mỗi account 1 profile)
+    4. Điền thông tin vào accounts.txt
+    5. python main.py
 
-Usage:
-    python main.py                          # default 5 concurrent (HTTP)
-    python main.py --concurrency 10        # faster but riskier
-    python main.py --concurrency 1         # one at a time (debug)
-    python main.py --browser                # use Playwright (no captcha)
+FORMAT accounts.txt:
+    username:password:region:proxy:profile_id:ws_url
+    
+    Ví dụ:
+    acc1@gmail.com:pass123:ap:http://user:pass@proxy:8080:abc123:
+    acc2@gmail.com:pass456:eu::def456:ws://localhost:9222
+    
+    - profile_id: ID từ GoLogin app (Settings > Profile ID)
+    - ws_url: WebSocket URL (để trống = tự động tìm)
 """
 from __future__ import annotations
 
 import asyncio
-import httpx
+import subprocess as _subprocess
 import json
 import logging
 import os
 import random
 import re
 import secrets
+import shutil
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
-from dotenv import load_dotenv
-load_dotenv()
+from typing import Optional
 
-# ── logging ──────────────────────────────────────────────────────────────────
+import httpx
 
-def _setup_logging():
-    os.makedirs("logs", exist_ok=True)
-    logger.remove()
-    logger.add(
-        sys.stderr,
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="<level>{time:HH:mm:ss} | {message}</level>",
-        colorize=True,
-    )
-    logger.add(
-        f"logs/run_{datetime.now():%Y%m%d_%H%M%S}.log",
-        level="DEBUG",
-        rotation="10 MB",
-    )
+# Setup logging
+os.makedirs("logs", exist_ok=True)
 
-from loguru import logger
-_setup_logging()
+logger = logging.getLogger("valorant_checker")
+logger.setLevel(logging.INFO)
 
-# ── paths ─────────────────────────────────────────────────────────────────────
+ch = logging.StreamHandler()
+ch.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S"))
+logger.addHandler(ch)
+
+fh = logging.FileHandler(f"logs/run_{datetime.now():%Y%m%d_%H%M%S}.log", encoding="utf-8")
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+logger.addHandler(fh)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
 
 SCRIPT_DIR = Path(__file__).parent
 ACCOUNTS_FILE = SCRIPT_DIR / "accounts.txt"
-PROXIES_FILE  = SCRIPT_DIR / "proxies.txt"
-ACCOUNTS_JSON = SCRIPT_DIR / "accounts.json"
-VERSION_CACHE = SCRIPT_DIR / "riot_version.json"
+PROFILES_CACHE = SCRIPT_DIR / "profiles_cache.json"
+PROFILES_DIR = SCRIPT_DIR / "profiles"
+PROXIES_FILE = SCRIPT_DIR / "proxies.txt"
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", r"C:\Users\WORK\Desktop\Check-done"))
 
-# ── config ───────────────────────────────────────────────────────────────────
+# GoLogin / Orbita browser path
+GOLOGIN_BROWSER_PATH = Path(os.getenv(
+    "GOLOGIN_BROWSER",
+    r"C:\Users\WORK\Downloads\Gologin\All-Browsers\orbita-browser-145\chrome.exe",
+))
 
-CONCURRENCY   = 5          # max simultaneous accounts
-DELAY_MIN     = 0.3        # was 3s — sleep between batches (seconds)
-DELAY_MAX     = 1.2        # was 6s
+CONCURRENCY = int(os.getenv("CONCURRENCY", "2"))  # Số browser chạy song song
 
+# Port counter cho mỗi browser instance
+_next_debug_port = 9222
+
+# Riot constants
 RIOT_PLATFORM = (
     "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVm"
     "Vyc2lvbiI6ICIxMC4wLjE5MDQyLjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9"
 )
-UUID_SKINS    = "e7c63390-eda7-46e0-bb7a-a6abdacd2433"
-UUID_VP       = "85ad13f7-3d1b-5128-9eb2-7cd8ee0b5741"
-UUID_RP       = "e59aa87c-4cbf-517a-5983-6e81511be9b7"
-UUID_KC       = "85ca954a-41f2-4a9f-9e6b-0283ccc65d64"
-UUID_FA       = "f2c6e9b4-8d7a-4c3e-9f1b-5a7d3e9f2c6b"
-HTTPX_TIMEOUT = 10.0
+UUID_SKINS = "e7c63390-eda7-46e0-bb7a-a6abdacd2433"
 
 RANK_NAMES = [
     "Unrated","Iron 1","Iron 2","Iron 3",
@@ -98,1515 +99,1518 @@ RANK_NAMES = [
     "Radiant",
 ]
 
-# ── args ─────────────────────────────────────────────────────────────────────
-
-SKIP_MENU = False
-USE_BROWSER = False
-BROWSER_HEADLESS = False
-
-for i, arg in enumerate(sys.argv):
-    if arg == "--cli":
-        SKIP_MENU = True
-    elif arg == "--concurrency" and i + 1 < len(sys.argv):
-        try:
-            CONCURRENCY = max(1, int(sys.argv[i + 1]))
-        except ValueError:
-            pass
-    elif arg == "--delay" and i + 1 < len(sys.argv):
-        try:
-            v = float(sys.argv[i + 1])
-            DELAY_MIN = max(0, v / 2)
-            DELAY_MAX = v
-        except ValueError:
-            pass
-    elif arg == "--browser":
-        USE_BROWSER = True
-    elif arg == "--headless":
-        BROWSER_HEADLESS = True
-
-
-def parse_proxy(proxy: str) -> str:
-    """
-    Parse proxy string to httpx-compatible format.
-    Supports formats:
-      - http://user:pass@host:port
-      - host:port:user:pass (provider format)
-      - host:port (no auth)
-    Returns httpx-compatible proxy URL.
-    """
-    proxy = proxy.strip()
-    if not proxy:
-        return ""
-
-    # Already has scheme
-    if proxy.startswith("http://") or proxy.startswith("https://"):
-        return proxy
-
-    # host:port:user:pass format (provider format)
-    if proxy.count(":") >= 3:
-        parts = proxy.split(":")
-        if len(parts) >= 4:
-            host = parts[0]
-            port = parts[1]
-            user = parts[2]
-            pwd = ":".join(parts[3:])
-            return f"http://{user}:{pwd}@{host}:{port}"
-
-    # host:port format (no auth)
-    return f"http://{proxy}"
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
-# ACCOUNT DB  (accounts.json — persistent token storage)
+# DATA CLASSES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _load_db() -> dict:
-    if not ACCOUNTS_JSON.exists():
-        return {}
-    try:
-        return json.loads(ACCOUNTS_JSON.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-def _save_db(data: dict):
-    ACCOUNTS_JSON.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-
-def _get_saved_tokens(username: str) -> dict | None:
-    db = _load_db()
-    entry = db.get(username.lower())
-    if not entry:
-        return None
-    tokens = entry.get("tokens") or entry.get("token")
-    if not tokens:
-        return None
-    return tokens
-
-async def _save_tokens(username: str, password: str, region: str, tokens: dict):
-    # BUG FIX (Bug 4): use _db_lock to prevent concurrent writes to accounts.json.
-    # Without lock: Account A reads → Account B reads → A writes → B writes → A's data lost.
-    async with _db_lock:
-        db = _load_db()
-        key = username.lower()
-        entry = db.get(key, {})
-        entry.update({"username": username, "password": password, "region": region, "tokens": tokens})
-        db[key] = entry
-        _save_db(db)
-        logger.debug(f"  [db] Saved tokens for {username}")
-
-def _remove_tokens(username: str):
-    db = _load_db()
-    key = username.lower()
-    if key in db and "tokens" in db[key]:
-        del db[key]["tokens"]
-        _save_db(db)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# VERSION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# BUG FIX: creating a new asyncio.Lock() per-call means the lock is useless.
-# Multiple concurrent accounts bypass the cache lock entirely. Use ONE module-level lock.
-_VERSION_LOCK = asyncio.Lock()
-
-
-async def _get_version(_lock: asyncio.Lock | None = None) -> str:
-    """Fetch client version once, cache in file, reuse across all accounts."""
-    lock = _lock if _lock is not None else _VERSION_LOCK
-    async with lock:
-        try:
-            if VERSION_CACHE.exists():
-                cached = json.loads(VERSION_CACHE.read_text(encoding="utf-8"))
-                age = (datetime.now() - datetime.fromisoformat(cached["cached_at"])).total_seconds()
-                if age < 3600:
-                    return cached["version"]
-        except Exception:
-            pass
-
-        import httpx
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get("https://valorant-api.com/v1/version")
-                if resp.is_success:
-                    version = resp.json()["data"]["riotClientVersion"]
-                    VERSION_CACHE.write_text(
-                        json.dumps({"version": version, "cached_at": datetime.now().isoformat()}),
-                        encoding="utf-8",
-                    )
-                    return version
-        except Exception as e:
-            logger.warning(f"  version fetch failed: {e}")
-        return "release-12.10-shipping-17-4738152"
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# LOCKFILE
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _lockfile_tokens() -> dict | None:
-    import base64, subprocess
-    lockfile_path = Path(os.getenv("LOCALAPPDATA",
-        os.path.expanduser("~\\AppData\\Local")
-    )) / "Riot Games" / "Riot Client" / "Config" / "lockfile"
-
-    if not lockfile_path.exists():
-        return None
-    try:
-        parts = lockfile_path.read_text(encoding="utf-8").strip().split(":")
-        if len(parts) < 5:
+@dataclass
+class Account:
+    username: str
+    password: str
+    region: str = "ap"
+    proxy: str = ""
+    profile_id: str = ""
+    ws_url: str = ""
+    
+    @staticmethod
+    def parse(line: str) -> Optional["Account"]:
+        """Parse 1 dòng từ accounts.txt"""
+        line = line.strip()
+        if not line or line.startswith("#"):
             return None
-        port, password = int(parts[2]), parts[3]
-    except Exception:
-        return None
-
-    auth = base64.b64encode(f"riot:{password}".encode()).decode()
-    try:
-        result = subprocess.run(
-            ["curl", "-s", "-k", "-X", "GET",
-             "-H", f"Authorization: Basic {auth}",
-             f"https://127.0.0.1:{port}/entitlements/v1/token"],
-            capture_output=True, text=True, timeout=5,
+        
+        # format: username:password:region:proxy:profile_id:ws_url
+        parts = line.split(":")
+        if len(parts) < 2:
+            return None
+        
+        return Account(
+            username=parts[0],
+            password=parts[1],
+            region=parts[2].lower() if len(parts) > 2 else "ap",
+            proxy=parts[3] if len(parts) > 3 else "",
+            profile_id=parts[4] if len(parts) > 4 else "",
+            ws_url=parts[5] if len(parts) > 5 else "",
         )
-        if result.returncode != 0:
+
+
+@dataclass
+class ProxyInfo:
+    """Thông tin proxy đã parse từ proxies.txt.
+    
+    Format mỗi dòng: ip:port:user:pass hoặc ip:port
+    """
+    host: str
+    port: int
+    username: str = ""
+    password: str = ""
+    
+    @property
+    def server(self) -> str:
+        """host:port cho --proxy-server flag của Chrome."""
+        return f"{self.host}:{self.port}"
+    
+    @property
+    def http_url(self) -> str:
+        """URL đầy đủ cho httpx client."""
+        if self.username and self.password:
+            return f"http://{self.username}:{self.password}@{self.host}:{self.port}"
+        return f"http://{self.host}:{self.port}"
+    
+    @staticmethod
+    def parse(line: str) -> Optional["ProxyInfo"]:
+        """Parse 1 dòng từ proxies.txt."""
+        line = line.strip()
+        if not line or line.startswith("#"):
             return None
-        data = json.loads(result.stdout)
-        at = data.get("accessToken", "")
-        et = data.get("token", "")
-        puuid = data.get("subject", "")
-        if not at or not et:
+        parts = line.split(":")
+        if len(parts) < 2:
             return None
-        return {
-            "access_token": at,
-            "entitlements_token": et,
-            "puuid": puuid,
-            "expires_at": datetime.now().timestamp() + 3600,
-            "refresh_token": "",
-        }
-    except Exception:
+        try:
+            return ProxyInfo(
+                host=parts[0],
+                port=int(parts[1]),
+                username=parts[2] if len(parts) > 2 else "",
+                password=parts[3] if len(parts) > 3 else "",
+            )
+        except (ValueError, IndexError):
+            return None
+
+
+@dataclass
+class Result:
+    ok: bool
+    username: str
+    password: str = ""
+    game_name: str = ""
+    tag_line: str = ""
+    puuid: str = ""
+    region: str = ""
+    level: int = 0
+    tier: int = 0
+    rr: int = 0
+    vp: int = 0
+    rp: int = 0
+    kc: int = 0
+    skins_count: int = 0
+    status: str = "error"
+    status_label: str = "❌ ERROR"
+    error: str = ""
+    country: str = ""
+    email_verified: bool = False
+    phone_verified: bool = False
+    created_at: str = ""
+    
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GOLOGIN CONNECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _alloc_debug_port() -> int:
+    """Cấp 1 debug port duy nhất cho mỗi browser instance."""
+    global _next_debug_port
+    port = _next_debug_port
+    _next_debug_port += 1
+    return port
+
+
+class GoLoginBrowser:
+    """
+    Tự động launch GoLogin Orbita browser rồi kết nối qua CDP.
+    
+    Flow:
+    1. Launch chrome.exe (Orbita) với --remote-debugging-port
+    2. Đợi browser sẵn sàng
+    3. Kết nối Playwright qua CDP
+    """
+    
+    def __init__(self, account: Account, proxy_info: Optional[ProxyInfo] = None):
+        self.account = account
+        self.browser = None
+        self.context = None
+        self.page = None
+        self._process: _subprocess.Popen | None = None
+        self._port: int = 0
+        self._playwright = None
+        self._pw_context_manager = None
+        self._proxy: Optional[ProxyInfo] = proxy_info
+        self._cdp_session = None
+        self._profile_dir: Optional[Path] = None
+    
+    async def connect(self) -> bool:
+        """
+        Launch Orbita browser rồi kết nối vào.
+        Returns True nếu thành công.
+        """
+        # Nếu có ws_url sẵn thì connect trực tiếp (không cần launch)
+        if self.account.ws_url:
+            return await self._connect_ws(self.account.ws_url)
+        
+        # Tự launch Orbita browser
+        return await self._launch_and_connect()
+    
+    async def _launch_and_connect(self) -> bool:
+        """Launch Orbita browser rồi kết nối qua CDP."""
+        chrome_exe = GOLOGIN_BROWSER_PATH
+        if not chrome_exe.exists():
+            logger.error(f"  GoLogin browser not found: {chrome_exe}")
+            return False
+        
+        # Tạo user-data-dir riêng cho mỗi account
+        safe_name = re.sub(r'[^\w.-]', '_', self.account.username)
+        self._profile_dir = PROFILES_DIR / f"{safe_name}_{hash(self.account.username) & 0xFFFFFFFF}"
+        self._profile_dir.mkdir(parents=True, exist_ok=True)
+        
+        self._port = _alloc_debug_port()
+        
+        # Build command
+        cmd = [
+            str(chrome_exe),
+            f"--remote-debugging-port={self._port}",
+            f"--user-data-dir={self._profile_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-translate",
+            "--metrics-recording-only",
+            "--no-service-autorun",
+            "--password-store=basic",
+            "about:blank",
+        ]
+        
+        # Thêm proxy server flag nếu có proxy
+        if self._proxy:
+            cmd.insert(-1, f"--proxy-server={self._proxy.server}")
+        
+        proxy_log = f" via proxy {self._proxy.server}" if self._proxy else ""
+        logger.info(f"  Launching Orbita on port {self._port} for {self.account.username}{proxy_log}")
+        
+        try:
+            self._process = _subprocess.Popen(
+                cmd,
+                stdout=_subprocess.DEVNULL,
+                stderr=_subprocess.DEVNULL,
+                creationflags=_subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
+            )
+        except Exception as e:
+            logger.error(f"  Failed to launch browser: {e}")
+            return False
+        
+        # Đợi browser ready (poll /json/version)
+        cdp_url = f"http://localhost:{self._port}"
+        ready = False
+        for attempt in range(30):  # Max 15 giây
+            await asyncio.sleep(0.5)
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as client:
+                    resp = await client.get(f"{cdp_url}/json/version")
+                    if resp.is_success:
+                        data = resp.json()
+                        ws_url = data.get("webSocketDebuggerUrl", "")
+                        if ws_url:
+                            logger.info(f"  Browser ready on port {self._port}")
+                            ready = True
+                            break
+            except:
+                pass
+        
+        if not ready:
+            logger.error(f"  Browser failed to start on port {self._port}")
+            self._kill_process()
+            return False
+        
+        # Kết nối Playwright qua CDP
+        return await self._connect_ws(f"http://localhost:{self._port}")
+    
+    async def _connect_ws(self, ws_url: str) -> bool:
+        """Kết nối qua WebSocket/CDP URL."""
+        try:
+            from playwright.async_api import async_playwright
+            
+            self._pw_context_manager = async_playwright()
+            self._playwright = await self._pw_context_manager.__aenter__()
+            self.browser = await self._playwright.chromium.connect_over_cdp(ws_url)
+            await self._setup_context()
+            return True
+        except Exception as e:
+            logger.error(f"  CDP connect error: {e}")
+            return False
+    
+    async def _setup_context(self):
+        """Setup browser context và page."""
+        if not self.browser:
+            return
+        
+        if self.browser.contexts:
+            self.context = self.browser.contexts[0]
+        else:
+            self.context = await self.browser.new_context()
+        
+        if self.context.pages:
+            self.page = self.context.pages[0]
+        else:
+            self.page = await self.context.new_page()
+        
+        # Setup proxy authentication nếu có proxy với credentials
+        if self._proxy and self._proxy.username:
+            await self._setup_proxy_auth()
+    
+    async def _setup_proxy_auth(self):
+        """Tự động xác thực proxy qua CDP Fetch domain.
+        
+        Khi browser được launch với --proxy-server=host:port, proxy yêu cầu
+        xác thực sẽ trả về 407. CDP Fetch domain bắt sự kiện authRequired
+        và tự động điền credentials mà không cần mở dialog.
+        """
+        if not self.page or not self._proxy:
+            return
+        try:
+            self._cdp_session = await self.context.new_cdp_session(self.page)
+            await self._cdp_session.send("Fetch.enable", {"handleAuthRequests": True})
+            
+            proxy = self._proxy
+            cdp = self._cdp_session
+            
+            def on_auth_required(params):
+                asyncio.ensure_future(cdp.send("Fetch.continueWithAuth", {
+                    "requestId": params["requestId"],
+                    "authChallengeResponse": {
+                        "response": "ProvideCredentials",
+                        "username": proxy.username,
+                        "password": proxy.password,
+                    }
+                }))
+            
+            self._cdp_session.on("Fetch.authRequired", on_auth_required)
+            logger.info(f"  Proxy auth handler ready for {self._proxy.server}")
+        except Exception as e:
+            logger.warning(f"  Proxy auth setup failed: {e}")
+    
+    def _kill_process(self):
+        """Kill browser process."""
+        if self._process:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=5)
+            except:
+                try:
+                    self._process.kill()
+                except:
+                    pass
+            self._process = None
+
+    async def _delete_temporary_profile(self):
+        """Xóa profile do script tự tạo sau khi browser đã đóng."""
+        profile_dir = self._profile_dir
+        self._profile_dir = None
+        if not profile_dir or not profile_dir.exists():
+            return
+
+        for attempt in range(5):
+            try:
+                await asyncio.to_thread(shutil.rmtree, profile_dir)
+                logger.info(f"  Deleted temporary profile: {profile_dir}")
+                return
+            except OSError as e:
+                if attempt == 4:
+                    logger.warning(f"  Cannot delete temporary profile {profile_dir}: {e}")
+                    return
+                await asyncio.sleep(0.5 * (attempt + 1))
+    
+    async def disconnect(self):
+        """Ngắt kết nối và kill browser."""
+        try:
+            if self._cdp_session:
+                await self._cdp_session.detach()
+        except:
+            pass
+        try:
+            if self.browser:
+                await self.browser.close()
+        except:
+            pass
+        try:
+            if self._pw_context_manager:
+                await self._pw_context_manager.__aexit__(None, None, None)
+        except:
+            pass
+        self._kill_process()
+        await self._delete_temporary_profile()
+    
+    async def is_logged_in(self) -> bool:
+        """Kiểm tra đã đăng nhập Riot chưa."""
+        if not self.context:
+            return False
+        
+        try:
+            # Thử gọi userinfo
+            cookies = await self.context.cookies()
+            cookie_dict = {c["name"]: c["value"] for c in cookies if c.get("name")}
+            
+            if "ssid" in cookie_dict or "clid" in cookie_dict:
+                # Có session cookie - thử verify
+                version = await self._get_version()
+                headers = {
+                    "Authorization": f"Bearer test",
+                    "X-Riot-ClientVersion": version,
+                    "X-Riot-ClientPlatform": RIOT_PLATFORM,
+                }
+                
+                # Thử get userinfo
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    r = await client.get(
+                        "https://auth.riotgames.com/userinfo",
+                        headers=headers,
+                        cookies=cookie_dict,
+                    )
+                    return r.status_code == 401  # 401 = có cookie nhưng hết hạn, có thể login lại
+            
+            return False
+        except:
+            return False
+    
+    async def get_tokens(self) -> Optional[dict]:
+        """
+        Lấy tokens từ GoLogin browser.
+        Ưu tiên: cookies → lockfile → browser login
+        """
+        if not self.context:
+            return None
+        
+        # Thử lấy từ cookies
+        tokens = await self._get_from_cookies()
+        if tokens:
+            return tokens
+        
+        # Thử lockfile (nếu Valorant đang chạy)
+        tokens = await self._get_from_lockfile()
+        if tokens:
+            return tokens
+        
         return None
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# HTTP AUTH  (headless — no browser)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def _http_login(username: str, password: str, region: str = "ap", proxy: str = "") -> dict | None:
-    """
-    Riot Auth API login via the correct RSO (Riot Sign-On) flow.
-    Flow: login → login-token → authorization → access_token
-    proxy format: http://user:pass@host:port or http://host:port
-    Returns tokens dict or None on failure.
-    """
-    import httpx
-
-    ver = await _get_version()
-    sdk = ver.split(".")[1] if "." in ver else "13.05.18"
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT": "1",
-        "Origin": "https://auth.riotgames.com",
-        "Referer": "https://auth.riotgames.com/",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-site",
-        "User-Agent": f"RiotClient/{sdk} rso-auth (Windows;10;;Professional, x64)",
-        "Cache-Control": "no-cache",
-        "X-Riot-ClientVersion": ver,
-        "X-Riot-ClientPlatform": RIOT_PLATFORM,
-        # Edge tracking headers - giúp bypass captcha
-        "X-Riot-Edge-Device-Guid": secrets.token_hex(16),
-        "X-Riot-Edge-Client-Version": ver,
-    }
-
-    # Build proxy config (parse provider format)
-    proxies = {}
-    parsed_proxy = parse_proxy(proxy)
-    if parsed_proxy:
-        proxies["http://"] = parsed_proxy
-        proxies["https://"] = parsed_proxy
-        short = proxy.split("@")[-1] if "@" in proxy else proxy
-        logger.debug(f"  [proxy] Using: {short}")
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=False, proxies=proxies) as client:
-            # Step 1: Initiate auth — get session_token
-            r1 = await client.post(
-                "https://authenticate.riotgames.com/api/v1/login",
-                headers=headers,
-                json={
-                    "clientId": "riot-client",
-                    "language": "en_US",
-                    "platform": "windows",
-                    "remember": False,
-                    "riot_identity": {
+    
+    async def _get_from_cookies(self) -> Optional[dict]:
+        """Lấy tokens bằng cách exchange cookies."""
+        if not self.context:
+            return None
+        
+        try:
+            cookies = await self.context.cookies()
+            cookie_dict = {c["name"]: c["value"] for c in cookies if c.get("name")}
+            
+            if not cookie_dict:
+                return None
+            
+            version = await self._get_version()
+            
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": f"RiotClient/80.0.1.1024.4762 rso-auth (Windows;10;;Professional, x64)",
+                "X-Riot-ClientVersion": version,
+                "X-Riot-ClientPlatform": RIOT_PLATFORM,
+            }
+            
+            # Proxy
+            proxies = {}
+            if self.account.proxy:
+                proxies = {"http://": self.account.proxy, "https://": self.account.proxy}
+            
+            async with httpx.AsyncClient(timeout=30.0, proxies=proxies) as client:
+                # Exchange cookies
+                r = await client.post(
+                    "https://authenticate.riotgames.com/api/v1/login",
+                    headers=headers,
+                    json={
+                        "clientId": "riot-client",
                         "language": "en_US",
-                        "state": "auth",
+                        "platform": "windows",
+                        "remember": False,
+                        "riot_identity": {"language": "en_US", "state": "auth"},
+                        "sdkVersion": "release-5.0.0.358.4781",
+                        "type": "auth",
                     },
-                    "sdkVersion": sdk,
-                    "type": "auth",
-                },
+                    cookies=cookie_dict,
+                )
+                
+                if not r.is_success:
+                    return None
+                
+                data = r.json()
+                
+                # Check captcha
+                if data.get("captcha"):
+                    logger.warning("  Captcha required")
+                    return None
+                
+                # Get session_token
+                session_token = data.get("session_token") or data.get("success", {}).get("session_token")
+                
+                if not session_token:
+                    # Thử kiểm tra xem cookies có valid không
+                    # Nếu response có login_token thì cookies còn valid
+                    login_token = data.get("login_token") or data.get("success", {}).get("login_token")
+                    if login_token:
+                        return await self._exchange_login_token(login_token, cookie_dict)
+                    return None
+                
+                # Get access token
+                r2 = await client.post(
+                    "https://auth.riotgames.com/api/v1/authorization",
+                    headers=headers,
+                    json={
+                        "client_id": "riot-client",
+                        "nonce": secrets.token_urlsafe(16),
+                        "redirect_uri": "http://localhost/redirect",
+                        "response_type": "token id_token",
+                        "scope": "openid link ban lol_region account",
+                    },
+                    cookies=cookie_dict,
+                )
+                
+                if not r2.is_success:
+                    return None
+                
+                uri = r2.json().get("response", {}).get("parameters", {}).get("uri", "")
+                if not uri:
+                    return None
+                
+                # Parse token
+                fragment = uri.split("#", 1)[-1]
+                params = {}
+                for pair in fragment.split("&"):
+                    if "=" in pair:
+                        k, _, v = pair.partition("=")
+                        params[k] = v
+                
+                access_token = params.get("access_token", "")
+                if not access_token:
+                    return None
+                
+                # Get entitlements
+                ent_resp = await client.post(
+                    "https://entitlements.auth.riotgames.com/api/token/v1",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    json={},
+                )
+                entitlements = ""
+                if ent_resp.is_success:
+                    entitlements = ent_resp.json().get("entitlements_token", "")
+                
+                # Get user info
+                user_resp = await client.get(
+                    "https://auth.riotgames.com/userinfo",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                puuid = ""
+                if user_resp.is_success:
+                    puuid = user_resp.json().get("sub", "")
+                
+                logger.info(f"  Got tokens via cookies for {self.account.username}")
+                return {
+                    "access_token": access_token,
+                    "entitlements_token": entitlements,
+                    "puuid": puuid,
+                }
+                
+        except Exception as e:
+            logger.error(f"  Cookie exchange error: {e}")
+            return None
+    
+    async def _exchange_login_token(self, login_token: str, cookies: dict) -> Optional[dict]:
+        """Exchange login_token sang tokens."""
+        try:
+            version = await self._get_version()
+            
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": f"RiotClient/80.0.1.1024.4762 rso-auth (Windows;10;;Professional, x64)",
+                "X-Riot-ClientVersion": version,
+                "X-Riot-ClientPlatform": RIOT_PLATFORM,
+            }
+            
+            proxies = {}
+            if self.account.proxy:
+                proxies = {"http://": self.account.proxy, "https://": self.account.proxy}
+            
+            async with httpx.AsyncClient(timeout=30.0, proxies=proxies) as client:
+                # Exchange login_token
+                r = await client.post(
+                    "https://auth.riotgames.com/api/v1/login-token",
+                    headers=headers,
+                    json={
+                        "authentication_type": "RiotAuth",
+                        "code_verifier": "",
+                        "login_token": login_token,
+                        "persist_login": False,
+                    },
+                    cookies=cookies,
+                )
+                
+                if not r.is_success:
+                    return None
+                
+                # Get access token
+                r2 = await client.post(
+                    "https://auth.riotgames.com/api/v1/authorization",
+                    headers=headers,
+                    json={
+                        "client_id": "riot-client",
+                        "nonce": secrets.token_urlsafe(16),
+                        "redirect_uri": "http://localhost/redirect",
+                        "response_type": "token id_token",
+                        "scope": "openid link ban lol_region account",
+                    },
+                    cookies=cookies,
+                )
+                
+                if not r2.is_success:
+                    return None
+                
+                uri = r2.json().get("response", {}).get("parameters", {}).get("uri", "")
+                if not uri:
+                    return None
+                
+                fragment = uri.split("#", 1)[-1]
+                params = {}
+                for pair in fragment.split("&"):
+                    if "=" in pair:
+                        k, _, v = pair.partition("=")
+                        params[k] = v
+                
+                access_token = params.get("access_token", "")
+                if not access_token:
+                    return None
+                
+                # Get entitlements
+                ent_resp = await client.post(
+                    "https://entitlements.auth.riotgames.com/api/token/v1",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    json={},
+                )
+                entitlements = ""
+                if ent_resp.is_success:
+                    entitlements = ent_resp.json().get("entitlements_token", "")
+                
+                # Get user info
+                user_resp = await client.get(
+                    "https://auth.riotgames.com/userinfo",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                puuid = ""
+                if user_resp.is_success:
+                    puuid = user_resp.json().get("sub", "")
+                
+                return {
+                    "access_token": access_token,
+                    "entitlements_token": entitlements,
+                    "puuid": puuid,
+                }
+                
+        except Exception as e:
+            logger.error(f"  Login token exchange error: {e}")
+            return None
+    
+    async def _get_from_lockfile(self) -> Optional[dict]:
+        """Lấy tokens từ Valorant/Riot Client lockfile."""
+        import base64
+        import subprocess
+        
+        lockfile_path = Path(os.getenv("LOCALAPPDATA", 
+            os.path.expanduser("~\\AppData\\Local")
+        )) / "Riot Games" / "Riot Client" / "Config" / "lockfile"
+        
+        if not lockfile_path.exists():
+            return None
+        
+        try:
+            parts = lockfile_path.read_text(encoding="utf-8").strip().split(":")
+            if len(parts) < 5:
+                return None
+            
+            port = int(parts[2])
+            password = parts[3]
+            auth = base64.b64encode(f"riot:{password}".encode()).decode()
+            
+            result = subprocess.run(
+                ["curl", "-s", "-k", "-X", "GET",
+                 "-H", f"Authorization: Basic {auth}",
+                 f"https://127.0.0.1:{port}/entitlements/v1/token"],
+                capture_output=True, text=True, timeout=5,
             )
-
-            if r1.status_code == 429:
-                logger.warning(f"  [http] Rate limited — wait 60s")
-                await asyncio.sleep(60)
+            
+            if result.returncode != 0:
                 return None
+            
+            data = json.loads(result.stdout)
+            at = data.get("accessToken", "")
+            et = data.get("token", "")
+            puuid = data.get("subject", "")
+            
+            if at and et:
+                logger.info("  Got tokens from lockfile")
+                return {
+                    "access_token": at,
+                    "entitlements_token": et,
+                    "puuid": puuid,
+                }
+        except:
+            pass
+        
+        return None
+    
+    async def do_login(self) -> Optional[dict]:
+        """Đăng nhập trực tiếp trên browser."""
+        if not self.page:
+            return None
+        
+        try:
+            # Intercept localhost redirect to prevent loading failure and chrome-error
+            async def handle_redirect(route):
+                await route.fulfill(
+                    status=200,
+                    content_type="text/html",
+                    body="<html><body><h1>Login successful! Processing tokens...</h1></body></html>"
+                )
+            # Chỉ intercept khi URL thực sự chuyển hướng về localhost/redirect
+            await self.page.route(lambda url: url.startswith("http://localhost/redirect"), handle_redirect)
 
-            if not r1.is_success:
-                try:
-                    err = r1.json()
-                    logger.warning(f"  [http] Step 1 failed {r1.status_code}: {err.get('error_description', r1.text[:200])}")
-                except Exception:
-                    logger.warning(f"  [http] Step 1 failed {r1.status_code}: {r1.text[:200]}")
-                return None
-
-            data1 = r1.json()
-
-            if data1.get("captcha"):
-                logger.warning(f"  [http] Captcha required during login")
-                return {"_status": "captcha_required"}
-
-            session_token = data1.get("session_token") or data1.get("success", {}).get("session_token", "")
-            if not session_token:
-                logger.warning(f"  [http] No session_token in step 1 response: {r1.text[:200]}")
-                return None
-
-            # Step 2: Send credentials with session_token
-            r2 = await client.put(
-                "https://authenticate.riotgames.com/api/v1/login",
-                headers=headers,
-                json={
-                    "type": "auth",
-                                "username": username,
-                    "password": password,
-                    "session_token": session_token,
-                },
+            # Navigate to Riot auth
+            await self.page.goto(
+                "https://auth.riotgames.com/authorize"
+                "?redirect_uri=http://localhost/redirect"
+                "&client_id=riot-client"
+                "&response_type=token%20id_token"
+                "&nonce=1"
+                "&scope=openid%20link%20ban%20lol_region%20account",
+                wait_until="domcontentloaded",
+                timeout=30_000,
             )
-
-            if not r2.is_success:
-                try:
-                    err2 = r2.json()
-                    err_type = (err2.get("error") or "").lower()
-                    err_desc = (err2.get("error_description") or "").lower()
-                    logger.warning(f"  [http] Step 2 failed: {err_desc or r2.text[:200]}")
-                    if "mfa" in err_type or "mfa" in err_desc or "two-factor" in err_desc:
-                        return {"_status": "mfa_required"}
-                    if "invalid" in err_type or "invalid" in err_desc:
-                        return {"_status": "wrong_password"}
-                    if "captcha" in err_type or "captcha" in err_desc:
-                        return {"_status": "captcha_required"}
-                    if "rate" in err_type or "rate" in err_desc or "lockout" in err_desc:
-                        return {"_status": "rate_limited"}
-                except Exception:
-                    logger.warning(f"  [http] Step 2 failed {r2.status_code}: {r2.text[:200]}")
-                return None
-
-            data2 = r2.json()
-            if data2.get("error"):
-                err_desc = data2.get("error_description", "").lower()
-                err_type = data2.get("error", "").lower()
-                logger.warning(f"  [http] Step 2 error: {err_desc or err_type}")
-                if "mfa" in err_type or "mfa" in err_desc:
-                    return {"_status": "mfa_required"}
-                if "invalid" in err_type or "invalid" in err_desc:
-                    return {"_status": "wrong_password"}
-                if "captcha" in err_type or "captcha" in err_desc:
-                    return {"_status": "captcha_required"}
-                return None
-
-            # Step 3: Exchange to access_token via authorization
-            r3 = await client.post(
-                "https://auth.riotgames.com/api/v1/authorization",
-                headers=headers,
-                json={
-                    "client_id": "riot-client",
-                    "nonce": secrets.token_urlsafe(16),
-                    "redirect_uri": "http://localhost/redirect",
-                    "response_type": "token id_token",
-                    "scope": "openid link ban lol_region account",
-                },
-            )
-
-            if not r3.is_success:
-                logger.warning(f"  [http] Step 3 failed {r3.status_code}: {r3.text[:200]}")
-                return None
-
-            data3 = r3.json()
-            uri = (data3.get("response", {}) or data3 or {}).get("parameters", {}).get("uri", "")
-            if not uri:
-                logger.warning(f"  [http] No redirect URI in step 3: {r3.text[:200]}")
-                return None
-
-            # Parse token from URI fragment
-            fragment = uri.split("#", 1)[-1]
+            
+            username_filled = False
+            password_filled = False
+            
+            logger.info(f"  Waiting for login completion for {self.account.username} (max 180s)...")
+            
+            # Vòng lặp chờ chuyển hướng (180 giây)
+            for attempt in range(360):
+                await asyncio.sleep(0.5)
+                
+                # 1. Kiểm tra nếu đã login thành công và chuyển hướng lấy token
+                url = self.page.url
+                if "access_token=" in url:
+                    return await self._parse_token_from_url(url)
+                
+                # 2. Điền username tự động nếu thấy ô nhập
+                if not username_filled:
+                    try:
+                        username_input = await self.page.query_selector('input[name="username"]')
+                        if username_input and await username_input.is_visible():
+                            val = await username_input.input_value()
+                            if not val:
+                                await username_input.fill(self.account.username)
+                                username_filled = True
+                                logger.info(f"  Filled username for {self.account.username}")
+                                
+                                # Chỉ nhấn Enter nếu ô password chưa xuất hiện (multi-step login)
+                                password_input = await self.page.query_selector('input[name="password"]')
+                                if not password_input or not await password_input.is_visible():
+                                    await self.page.keyboard.press("Enter")
+                                    logger.info(f"  Pressed Enter on username (multi-step layout)")
+                    except:
+                        pass
+                
+                # 3. Điền password tự động nếu thấy ô nhập
+                if not password_filled:
+                    try:
+                        password_input = await self.page.query_selector('input[name="password"]')
+                        if password_input and await password_input.is_visible():
+                            val = await password_input.input_value()
+                            if not val:
+                                await password_input.fill(self.account.password)
+                                await asyncio.sleep(0.5)
+                                # Click nút sign in submit
+                                submit_btn = await self.page.query_selector('button[data-testid="btn-signin-submit"]')
+                                if submit_btn and await submit_btn.is_visible():
+                                    await submit_btn.click()
+                                    password_filled = True
+                                    logger.info(f"  Filled password and clicked sign in for {self.account.username}")
+                    except:
+                        pass
+            
+            logger.warning(f"  Login timeout for {self.account.username}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"  Browser login error: {e}")
+            return None
+    
+    async def _parse_token_from_url(self, url: str) -> Optional[dict]:
+        """Parse tokens từ redirect URL."""
+        try:
+            fragment = url.split("#", 1)[-1]
             params = {}
             for pair in fragment.split("&"):
                 if "=" in pair:
                     k, _, v = pair.partition("=")
                     params[k] = v
-
+            
             access_token = params.get("access_token", "")
             if not access_token:
-                logger.warning(f"  [http] No access_token in redirect URI")
                 return None
-
-            # Step 4: Get entitlements
-            ent_resp = await client.post(
+            
+            # Get entitlements
+            ent_resp = await self.context.request.post(
                 "https://entitlements.auth.riotgames.com/api/token/v1",
                 headers={"Authorization": f"Bearer {access_token}"},
-                json={},
+                data={},
             )
             entitlements = ""
-            if ent_resp.is_success:
-                entitlements = ent_resp.json().get("entitlements_token", "")
-
-            # Step 5: Get user info
-            user_resp = await client.get(
+            if ent_resp.ok:
+                entitlements = (await ent_resp.json()).get("entitlements_token", "")
+            
+            # Get user info
+            user_resp = await self.context.request.get(
                 "https://auth.riotgames.com/userinfo",
                 headers={"Authorization": f"Bearer {access_token}"},
             )
-            user_data = user_resp.json() if user_resp.is_success else {}
-            puuid = user_data.get("sub", "")
-
+            puuid = ""
+            if user_resp.ok:
+                puuid = (await user_resp.json()).get("sub", "")
+            
+            logger.info(f"  Got tokens via browser login for {self.account.username}")
             return {
                 "access_token": access_token,
                 "entitlements_token": entitlements,
                 "puuid": puuid,
-                                "region": region,
-                "expires_at": datetime.now().timestamp() + 3600,
-                "refresh_token": "",
             }
-
-    except httpx.TimeoutException:
-        logger.warning(f"  [http] Timeout during login")
-        return None
-    except Exception as e:
-        logger.warning(f"  [http] Login error: {e}")
-        return None
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TOKEN ACQUISITION  (strategy: lockfile → saved → HTTP login)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def _get_tokens(
-    username: str,
-    password: str,
-    region: str,
-    version: str,
-    proxy: str = "",
-) -> tuple[str, str, str, str] | None:
-    """
-    Returns (access_token, entitlements_token, puuid, status_str) or None.
-    status_str is used for categorization on failure.
-    """
-    import httpx
-
-    # ── Strategy 1: Lockfile (instant, shared — all accounts use same token) ──
-    # BUG FIX: was calling _lockfile_tokens() TWICE — once for truthiness check,
-    # once to extract. Each call re-reads lockfile + spawns subprocess.
-    lockfile_result = _lockfile_tokens()
-    if lockfile_result:
-        logger.debug(f"  [auth] lockfile")
-        return lockfile_result["access_token"], lockfile_result["entitlements_token"], lockfile_result["puuid"], "lockfile"
-
-    # ── Strategy 2: Saved tokens in accounts.json ─────────────────────────
-    saved = _get_saved_tokens(username)
-    if saved:
-        expires_at = saved.get("expires_at", 0)
-        access_token = saved.get("access_token", "")
-        entitlements = saved.get("entitlements_token", "")
-        refresh_token = saved.get("refresh_token", "")
-        saved_puuid = saved.get("puuid", "")
-
-        # Token still valid (with 2-min buffer)?
-        if expires_at > datetime.now().timestamp() + 120 and access_token:
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    ent_resp = await client.post(
-                        "https://entitlements.auth.riotgames.com/api/token/v1",
-                        headers={"Authorization": f"Bearer {access_token}"},
-                        json={},
-                    )
-                    entitlements = ent_resp.json().get("entitlements_token", "") if ent_resp.is_success else ""
-                    user_resp = await client.get(
-                        "https://auth.riotgames.com/userinfo",
-                        headers={"Authorization": f"Bearer {access_token}"},
-                    )
-                    user_data = user_resp.json() if user_resp.is_success else {}
-                    puuid = user_data.get("sub", "") or saved_puuid
-                    logger.debug(f"  [auth] saved token still valid")
-                    return access_token, entitlements, puuid, "saved"
-            except Exception:
-                pass
-
-        # BUG FIX: removed dead code — Riot RSO (riot-client flow) does NOT support
-        # OAuth refresh_token grants. The endpoint auth.riotgames.com/token with
-        # grant_type=refresh_token returns 400. This block never worked.
-        # Saved tokens expire → must re-login via HTTP or browser.
-
-    # ── Strategy 3: HTTP login ───────────────────────────────────────────────
-    if USE_BROWSER:
-        logger.debug(f"  [auth] Browser login for {username}...")
-        from auth import get_tokens as pw_get_tokens
-        try:
-            pw_result = await pw_get_tokens(username, password, proxy, BROWSER_HEADLESS)
-            if pw_result:
-                at = pw_result.get("access_token", "")
-                et = pw_result.get("entitlements_token", "")
-                pu = pw_result.get("puuid", "")
-                if at:
-                    await _save_tokens(username, password, region, pw_result)
-                    return at, et, pu, "browser"
         except Exception as e:
-            logger.debug(f"  [auth] Browser login failed: {e}")
+            logger.error(f"  Parse token error: {e}")
+            return None
+    
+    async def _get_version(self) -> str:
+        """Get Riot client version."""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get("https://valorant-api.com/v1/version")
+                if resp.is_success:
+                    return resp.json()["data"]["riotClientVersion"]
+        except:
+            pass
+        return "release-12.10-shipping-17-4738152"
 
-    logger.debug(f"  [auth] HTTP login for {username}...")
-    result = await _http_login(username, password, region, proxy)
 
-    if not result:
-        return None
+# Bản đồ ánh xạ level_uuid -> base_skin_name
+VALORANT_SKINS_MAP: dict[str, str] = {}
 
-    status = result.get("_status")
-    if status:
-        return (None, None, None, status)
+async def load_valorant_skins_map():
+    """Tải danh sách skin từ valorant-api.com và ánh xạ các level về skin gốc."""
+    global VALORANT_SKINS_MAP
+    if VALORANT_SKINS_MAP:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get("https://valorant-api.com/v1/weapons/skins")
+            if resp.is_success:
+                data = resp.json().get("data", [])
+                for skin in data:
+                    base_name = skin.get("displayName", "")
+                    for level in skin.get("levels", []):
+                        lvl_uuid = level.get("uuid")
+                        if lvl_uuid:
+                            VALORANT_SKINS_MAP[lvl_uuid.lower()] = base_name
+                logger.info(f"Loaded {len(VALORANT_SKINS_MAP)} skin levels into map")
+    except Exception as e:
+        logger.error(f"Failed to load valorant skins map from API: {e}")
 
-    access_token = result.get("access_token", "")
-    entitlements = result.get("entitlements_token", "")
-    puuid = result.get("puuid", "")
 
-    if not access_token:
-        return None
-
-    # Save for next run
-    await _save_tokens(username, password, region, result)
-
-    return access_token, entitlements, puuid, "http_login"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# RIOT API CALLS
+# RIOT API
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _fetch_userinfo(
-    client: httpx.AsyncClient,
+async def get_account_data(
     access_token: str,
     entitlements: str,
-    version: str,
     puuid: str,
     region: str,
+    proxy: str = "",
 ) -> dict:
+    """Lấy tất cả data của account."""
+    version = "release-12.10-shipping-17-4738152"
+    
+    # Get version
     try:
-        r = await client.get(
-            "https://auth.riotgames.com/userinfo",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "X-Riot-ClientVersion": version,
-                "X-Riot-ClientPlatform": RIOT_PLATFORM,
-            },
-        )
-        return r.json() if r.is_success else {}
-    except Exception:
-        return {}
-
-async def _fetch_wallet(
-    client: httpx.AsyncClient,
-    access_token: str,
-    entitlements: str,
-    version: str,
-    puuid: str,
-    region: str,
-) -> dict:
-    try:
-        r = await client.get(
-            f"https://pd.{region.lower()}.a.pvp.net/store/v1/wallet/{puuid}",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "X-Riot-Entitlements-JWT": entitlements,
-                "X-Riot-ClientVersion": version,
-                "X-Riot-ClientPlatform": RIOT_PLATFORM,
-            },
-        )
-        if r.is_success:
-            bals = r.json().get("Balances", {})
-            uuids = list(bals.keys())
-            return {
-                "vp": int(bals.get(uuids[0], 0)) if len(uuids) > 0 else 0,
-                "rp": int(bals.get(uuids[1], 0)) if len(uuids) > 1 else 0,
-                "kc": int(bals.get(uuids[2], 0)) if len(uuids) > 2 else 0,
-                "fa": int(bals.get(uuids[3], 0)) if len(uuids) > 3 else 0,
-            }
-    except Exception:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get("https://valorant-api.com/v1/version")
+            if resp.is_success:
+                version = resp.json()["data"]["riotClientVersion"]
+    except:
         pass
-    return {"vp": 0, "rp": 0, "kc": 0, "fa": 0}
-
-async def _fetch_mmr(
-    client: httpx.AsyncClient,
-    access_token: str,
-    entitlements: str,
-    version: str,
-    puuid: str,
-    region: str,
-) -> tuple[int, int]:
-    try:
-        r = await client.get(
-            f"https://pd.{region.lower()}.a.pvp.net/mmr/v1/players/{puuid}",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "X-Riot-Entitlements-JWT": entitlements,
-                "X-Riot-ClientVersion": version,
-                "X-Riot-ClientPlatform": RIOT_PLATFORM,
-            },
-        )
-        if r.is_success:
-            data = r.json()
-            # Use LatestCompetitiveUpdate like web app (current rank from latest match)
-            comp = data.get("LatestCompetitiveUpdate", {})
-            tier = int(comp.get("TierAfterUpdate", 0))
-            rr = int(comp.get("RankedRatingAfterUpdate", 0))
-            if tier > 0:
-                return tier, rr
-            # Fallback: seasonal info
-            seasons = (data.get("QueueSkills", {})
-                       .get("competitive", {})
-                       .get("SeasonalInfoBySeasonID", {}))
-            if seasons:
-                latest = max(seasons.keys())
-                info = seasons[latest]
-                return int(info.get("CompetitiveTier", 0)), int(info.get("RankedRating", 0))
-    except Exception:
-        pass
-    return 0, 0
-
-async def _fetch_skins(
-    client: httpx.AsyncClient,
-    access_token: str,
-    entitlements: str,
-    version: str,
-    puuid: str,
-    region: str,
-) -> int:
-    try:
-        r = await client.get(
-            f"https://pd.{region.lower()}.a.pvp.net/store/v1/entitlements/{puuid}/{UUID_SKINS}",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "X-Riot-Entitlements-JWT": entitlements,
-                "X-Riot-ClientVersion": version,
-                "X-Riot-ClientPlatform": RIOT_PLATFORM,
-            },
-        )
-        if not r.is_success:
-            return 0
-
-        ent_list = r.json().get("Entitlements", [])
-        if not ent_list:
-            return 0
-
-        # Fetch skins data for deduplication
-        skins_r = await client.get("https://valorant-api.com/v1/weapons/skins")
-        if not skins_r.is_success:
-            # Fallback: return entitlements count
-            return len(ent_list)
-
-        skins_data = skins_r.json().get("data", [])
-
-        # Build level -> baseName map
-        level_to_name = {}
-        for skin in skins_data:
-            base_name = skin.get("displayName", "Unknown")
-            for level in skin.get("levels", []):
-                level_to_name[level.get("uuid", "")] = base_name
-
-        # Count unique skins
-        unique_names = set()
-        for ent in ent_list:
-            item_id = ent.get("ItemID", "")
-            if item_id in level_to_name:
-                unique_names.add(level_to_name[item_id])
-
-        return len(unique_names)
-    except Exception:
-        pass
-    return 0
-
-async def _fetch_xp(
-    client: httpx.AsyncClient,
-    access_token: str,
-    entitlements: str,
-    version: str,
-    puuid: str,
-    region: str,
-) -> int:
-    try:
-        r = await client.get(
-            f"https://pd.{region.lower()}.a.pvp.net/account-xp/v1/players/{puuid}",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "X-Riot-Entitlements-JWT": entitlements,
-                "X-Riot-ClientVersion": version,
-                "X-Riot-ClientPlatform": RIOT_PLATFORM,
-            },
-        )
-        if r.is_success:
-            data = r.json()
-            return int(data.get("Progress", {}).get("Level", data.get("Level", 0)))
-    except Exception:
-        pass
-    return 0
-
-async def _fetch_restrictions(
-    client: httpx.AsyncClient,
-    access_token: str,
-    entitlements: str,
-    version: str,
-    puuid: str,
-    region: str,
-) -> list:
-    try:
-        r = await client.get(
-            f"https://pd.{region.lower()}.a.pvp.net/restrictions/v1/players/{puuid}/restrictions",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "X-Riot-Entitlements-JWT": entitlements,
-                "X-Riot-ClientVersion": version,
-                "X-Riot-ClientPlatform": RIOT_PLATFORM,
-            },
-        )
-        if r.is_success:
-            return r.json().get("restrictions", [])
-    except Exception:
-        pass
-    return []
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# RESULT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class Result:
-    ok: bool
-    status: str           # "active" | "perm_ban" | "suspended" | "error" | "auth_fail"
-    status_label: str
-    username: str
-    game_name: str
-    tag_line: str
-    puuid: str
-    region: str
-    level: int
-    rank_str: str
-    current_tier: int
-    current_rr: int
-    vp: int; rp: int; kc: int; fa: int
-    skins_count: int
-    ban_reason: str
-    email_verified: bool
-    phone_verified: bool
-    country: str
-    created_at: str
-    error: str = ""
-
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        d["is_banned"] = not self.ok
-        d["account_status"] = self.status_label
-        return d
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# DB LOCK (Bug 4 fix)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# BUG FIX: previously _save_tokens() had no lock — 5 concurrent accounts would
-# read-modify-write accounts.json simultaneously, overwriting each other's tokens.
-_db_lock = asyncio.Lock()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PROCESS ONE ACCOUNT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def _process_one(
-    username: str,
-    password: str,
-    region: str,
-    version: str,
-    proxy: str,
-    sem: asyncio.Semaphore,
-) -> Result:
-    # BUG FIX (Bug 3): each account gets its own httpx client with its proxy.
-    # Previously used a shared client with no proxy, so all API calls went
-    # through the machine's default IP — inconsistent with browser auth IP,
-    # triggering captchas and rate limits from Riot.
+    
     proxies = {}
     if proxy:
         proxies = {"http://": proxy, "https://": proxy}
-
-    async with sem:
-        t0 = time.monotonic()
-        logger.debug(f"  [start] {username}")
-
-        # ── Auth ────────────────────────────────────────────────────────────
-        token_result = await _get_tokens(username, password, region, version, proxy)
-
-        if token_result is None:
-            return Result(
-                ok=False, status="auth_fail", status_label="❌ AUTH FAILED",
-                username=username, game_name="", tag_line="", puuid="",
-                region=region, level=0, rank_str="", current_tier=0, current_rr=0,
-                vp=0, rp=0, kc=0, fa=0, skins_count=0, ban_reason="",
-                email_verified=False, phone_verified=False, country="", created_at="",
-                error="all_auth_methods_failed",
-            )
-
-        access_token, entitlements, puuid, auth_method = token_result
-
-        if access_token is None:
-            label_map = {
-                "mfa_required":    "🔐 MFA REQUIRED",
-                "wrong_password":   "🔑 WRONG PASSWORD",
-                "captcha_required": "🤖 CAPTCHA",
-            }
-            return Result(
-                ok=False, status="auth_fail",
-                status_label=label_map.get(auth_method, f"❌ {auth_method.upper()}"),
-                username=username, game_name="", tag_line="", puuid="",
-                region=region, level=0, rank_str="", current_tier=0, current_rr=0,
-                vp=0, rp=0, kc=0, fa=0, skins_count=0, ban_reason="",
-                email_verified=False, phone_verified=False, country="", created_at="",
-                error=auth_method,
-            )
-
-        # ── API calls — each account gets own httpx client with proxy (Bug 3 fix) ──
-        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT, proxies=proxies) as client:
-            ui_task    = _fetch_userinfo(client, access_token, entitlements, version, puuid, region)
-            wl_task    = _fetch_wallet(client, access_token, entitlements, version, puuid, region)
-            mmr_task   = _fetch_mmr(client, access_token, entitlements, version, puuid, region)
-            sk_task    = _fetch_skins(client, access_token, entitlements, version, puuid, region)
-            xp_task    = _fetch_xp(client, access_token, entitlements, version, puuid, region)
-            res_task   = _fetch_restrictions(client, access_token, entitlements, version, puuid, region)
-
-            userinfo, wallet, (tier, rr), skins, level, restrictions = await asyncio.gather(
-                ui_task, wl_task, mmr_task, sk_task, xp_task, res_task,
-            )
-
-        # ── Parse user info ────────────────────────────────────────────────
-        game_name = userinfo.get("game_name", username.split("@")[0])
-        tag_line  = userinfo.get("tag_line", "")
-        if not puuid:
-            puuid = userinfo.get("sub", "")
-
-        # ── Determine status ────────────────────────────────────────────────
-        ban_reason = ""
-        status     = "active"
-        status_label = "✅ ACTIVE"
-
-        if restrictions:
-            r     = restrictions[0]
-            rtype = r.get("type", "")
-            reason = r.get("reason", "")
-            if "PERMANENT" in rtype.upper():
-                status = "perm_ban"
-                status_label = "🚫 BI CAM VINH VIEN"
-                ban_reason  = reason or rtype
-            else:
-                rest_until = r.get("rest_until")
-                if rest_until:
-                    until = datetime.fromtimestamp(rest_until / 1000, tz=timezone.utc).strftime("%d/%m/%Y")
-                    status_label = f"⏸ BI KHOA den {until}"
-                else:
-                    status_label = "⏸ BI KHOA TAM THOI"
-                status = "suspended"
-                ban_reason = reason or rtype
-
-        if not restrictions:
-            ban_data = userinfo.get("ban") or {}
-            if ban_data.get("flag"):
-                ban_reason = ban_data["flag"]
-                status = "perm_ban"
-                status_label = "🚫 BI CAM"
-            elif ban_data.get("restrictions"):
-                bans = ban_data["restrictions"]
-                if bans:
-                    r = bans[0]
-                    if "PERMANENT" in r.get("type", "").upper():
-                        status = "perm_ban"
-                        status_label = "🚫 BI CAM VINH VIEN"
-                        ban_reason = r.get("reason", "")
-                    else:
-                        status = "suspended"
-                        status_label = "⏸ BI KHOA"
-                        ban_reason = r.get("reason", "")
-
-        ok = status == "active"
-
-        rank_label = RANK_NAMES[tier] if 0 <= tier < len(RANK_NAMES) else f"Rank {tier}"
-        rank_str   = f"{rank_label} — {rr} RR" if tier > 0 else "Unrated"
-
-        created_at = ""
-        if userinfo.get("acct", {}).get("created_at"):
+    
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "X-Riot-Entitlements-JWT": entitlements,
+        "X-Riot-ClientVersion": version,
+        "X-Riot-ClientPlatform": RIOT_PLATFORM,
+    }
+    
+    async with httpx.AsyncClient(timeout=15.0, proxies=proxies) as client:
+        async def get(url):
             try:
-                created_at = datetime.fromisoformat(
-                    userinfo["acct"]["created_at"].replace("Z", "+00:00")
-                ).strftime("%d/%m/%Y")
-            except Exception:
-                created_at = userinfo["acct"]["created_at"]
-
-        elapsed = time.monotonic() - t0
-        logger.info(f"  [{elapsed:.1f}s] {username} | Skins:{skins} | {status_label}")
-
-        return Result(
-            ok=ok,
-            status=status,
-            status_label=status_label,
-            username=username,
-            game_name=game_name,
-            tag_line=tag_line,
-            puuid=puuid,
-            region=region,
-            level=level,
-            rank_str=rank_str,
-            current_tier=tier,
-            current_rr=rr,
-            vp=wallet["vp"], rp=wallet["rp"], kc=wallet["kc"], fa=wallet["fa"],
-            skins_count=skins,
-            ban_reason=ban_reason,
-            email_verified=userinfo.get("email_verified", False),
-            phone_verified=userinfo.get("phone_number_verified", False),
-            country=userinfo.get("country", ""),
-            created_at=created_at,
+                r = await client.get(url, headers=headers)
+                return r.json() if r.is_success else {}
+            except:
+                return {}
+        
+        async def get_mmr(url):
+            """MMR endpoint - captures ban status from 403/404."""
+            try:
+                r = await client.get(url, headers=headers)
+                if r.is_success:
+                    return r.json()
+                if r.status_code in (403, 404):
+                    body_text = r.text
+                    body_upper = body_text.upper()
+                    is_ban = r.status_code == 403 and (
+                        "BAN" in body_upper or "DENIED" in body_upper or "ACCESS_DENIED" in body_upper
+                    )
+                    return {"__ban__": is_ban, "__status__": r.status_code, "__body__": body_text}
+                return {}
+            except:
+                return {}
+        
+        # Gọi song song các API cơ bản
+        userinfo, wallet, mmr, skins, xp = await asyncio.gather(
+            get("https://auth.riotgames.com/userinfo"),
+            get(f"https://pd.{region}.a.pvp.net/store/v1/wallet/{puuid}"),
+            get_mmr(f"https://pd.{region}.a.pvp.net/mmr/v1/players/{puuid}"),
+            get(f"https://pd.{region}.a.pvp.net/store/v1/entitlements/{puuid}/{UUID_SKINS}"),
+            get(f"https://pd.{region}.a.pvp.net/account-xp/v1/players/{puuid}"),
         )
+        
+        # Parse balances
+        bals = wallet.get("Balances", {})
+        uuids = list(bals.keys())
+        vp = int(bals.get(uuids[0], 0)) if len(uuids) > 0 else 0
+        rp = int(bals.get(uuids[1], 0)) if len(uuids) > 1 else 0
+        kc = int(bals.get(uuids[2], 0)) if len(uuids) > 2 else 0
+        
+        # Parse Rank MMR (sử dụng LatestCompetitiveUpdate, nếu không có thì fallback qua competitive history)
+        tier, rr = 0, 0
+        comp = mmr.get("LatestCompetitiveUpdate", {})
+        
+        if not comp or not comp.get("MatchID"):
+            # Thử lấy lịch sử đấu xếp hạng nếu LatestCompetitiveUpdate trống
+            hist = await get(f"https://pd.{region}.a.pvp.net/mmr/v1/players/{puuid}/competitivehistory")
+            matches = hist.get("Matches", [])
+            if matches and isinstance(matches, list) and len(matches) > 0:
+                comp = matches[0]
+                tier = int(comp.get("TierAfterUpdate", 0))
+                rr = int(comp.get("RankedRatingAfterUpdate", 0))
+        else:
+            tier = int(comp.get("TierAfterUpdate", 0))
+            rr = int(comp.get("RankedRatingAfterUpdate", 0))
+        
+        # Deduplicate skins by mapping level UUID to base skin name
+        seen_skins = set()
+        for ent in skins.get("Entitlements", []):
+            item_id = ent.get("ItemID", "").lower()
+            base_name = VALORANT_SKINS_MAP.get(item_id)
+            if base_name:
+                seen_skins.add(base_name)
+        
+        skins_count = len(seen_skins) if VALORANT_SKINS_MAP else len(skins.get("Entitlements", []))
+        
+        level = xp.get("Progress", {}).get("Level", xp.get("Level", 0))
+        
+        # Lấy game_name và tag_line từ object acct
+        acct_info = userinfo.get("acct", {})
+        game_name = acct_info.get("game_name", "") or userinfo.get("game_name", "")
+        tag_line = acct_info.get("tag_line", "") or userinfo.get("tag_line", "")
+        
+        # Lấy thông tin xác minh & thời gian tạo tài khoản
+        email_verified = userinfo.get("email_verified", False)
+        phone_verified = userinfo.get("phone_number_verified", False) or userinfo.get("phone_verified", False)
+        country = userinfo.get("country", "")
+        
+        created_at_ms = acct_info.get("created_at")
+        created_at_str = ""
+        if created_at_ms:
+            try:
+                from datetime import datetime as dt_class
+                created_at_str = dt_class.fromtimestamp(created_at_ms / 1000).strftime("%d/%m/%Y")
+            except:
+                pass
+        
+        # ── Determine account ban status ──
+        account_status = "active"
+        account_status_label = "✅ ACTIVE"
+        
+        # Priority 1: MMR 403 with BAN keywords
+        if mmr.get("__ban__") is True:
+            body = mmr.get("__body__", "").upper()
+            if "ACCESS_DENIED" in body or "FORBIDDEN" in body:
+                account_status = "banned"
+                account_status_label = "🔴 BANNED (Access Denied)"
+            elif "TEMPORARY" in body:
+                account_status = "time_ban"
+                account_status_label = "🟡 TIME BAN"
+            else:
+                account_status = "banned"
+                account_status_label = "🔴 BANNED"
+        # Priority 2: userinfo.ban.restrictions
+        elif isinstance(userinfo.get("ban"), dict):
+            ban_info = userinfo["ban"]
+            restrictions = ban_info.get("restrictions", [])
+            if isinstance(restrictions, list) and len(restrictions) > 0:
+                r0 = restrictions[0] if isinstance(restrictions[0], dict) else {}
+                reason = r0.get("reason", "") or r0.get("type", "")
+                account_status = "banned"
+                account_status_label = f"🔴 BANNED: {reason}" if reason else "🔴 BANNED"
+            else:
+                flag = ban_info.get("flag")
+                if flag:
+                    rest_until = ban_info.get("rest_until")
+                    if rest_until and isinstance(rest_until, (int, float)):
+                        account_status = "time_ban"
+                        account_status_label = f"🟡 SUSPENDED until {datetime.fromtimestamp(rest_until).strftime('%d/%m/%Y')}"
+                    else:
+                        account_status = "banned"
+                        account_status_label = f"🔴 BANNED: {flag}"
+        # Priority 3: userinfo.accountStatus
+        elif userinfo.get("accountStatus") and userinfo.get("accountStatus") != "Active":
+            account_status = "banned"
+            account_status_label = f"🔴 {userinfo['accountStatus']}"
+        # Priority 4: AccountFlag
+        elif userinfo.get("AccountFlag") and userinfo.get("AccountFlag") != 0:
+            account_status = "flagged"
+            account_status_label = f"⚠️ FLAGGED: {userinfo['AccountFlag']}"
+        
+        return {
+            "game_name": game_name,
+            "tag_line": tag_line,
+            "puuid": puuid or userinfo.get("sub", ""),
+            "level": int(level),
+            "vp": vp,
+            "rp": rp,
+            "kc": kc,
+            "tier": tier,
+            "rr": rr,
+            "skins_count": skins_count,
+            "region": region,
+            "account_status": account_status,
+            "account_status_label": account_status_label,
+            "country": country,
+            "email_verified": email_verified,
+            "phone_verified": phone_verified,
+            "created_at": created_at_str,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PROCESS ACCOUNT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def process_account(account: Account, sem: asyncio.Semaphore, proxy_info: Optional[ProxyInfo] = None) -> Result:
+    """Xử lý 1 account."""
+    async with sem:
+        t0 = time.time()
+        
+        browser = GoLoginBrowser(account, proxy_info=proxy_info)
+        
+        try:
+            # Kết nối GoLogin
+            connected = await browser.connect()
+            if not connected:
+                return Result(
+                    ok=False,
+                    username=account.username,
+                    password=account.password,
+                    status="error",
+                    status_label="❌ CONNECT FAILED",
+                    error="Cannot connect to GoLogin browser",
+                )
+            
+            # Lấy tokens
+            tokens = await browser.get_tokens()
+            
+            # Nếu không có tokens, thử login trên browser
+            if not tokens:
+                logger.info(f"  No cookies - doing browser login for {account.username}")
+                tokens = await browser.do_login()
+            
+            if not tokens:
+                return Result(
+                    ok=False,
+                    username=account.username,
+                    password=account.password,
+                    status="auth_fail",
+                    status_label="❌ AUTH FAILED",
+                    error="Cannot get tokens",
+                )
+            
+            # Lấy account data
+            data = await get_account_data(
+                tokens["access_token"],
+                tokens["entitlements_token"],
+                tokens["puuid"],
+                account.region,
+                account.proxy,
+            )
+            
+            elapsed = time.time() - t0
+            logger.info(f"✓ {account.username} ({elapsed:.1f}s) | {data['skins_count']} skins")
+            
+            return Result(
+                ok=True,
+                username=account.username,
+                password=account.password,
+                game_name=data["game_name"],
+                tag_line=data["tag_line"],
+                puuid=data["puuid"],
+                region=data["region"],
+                level=data["level"],
+                tier=data["tier"],
+                rr=data["rr"],
+                vp=data["vp"],
+                rp=data["rp"],
+                kc=data["kc"],
+                skins_count=data["skins_count"],
+                status=data["account_status"],
+                status_label=data["account_status_label"],
+                country=data.get("country", ""),
+                email_verified=data.get("email_verified", False),
+                phone_verified=data.get("phone_verified", False),
+                created_at=data.get("created_at", ""),
+            )
+            
+        except Exception as e:
+            logger.error(f"Error processing {account.username}: {e}")
+            return Result(
+                ok=False,
+                username=account.username,
+                password=account.password,
+                status="error",
+                status_label="❌ ERROR",
+                error=str(e),
+            )
+        finally:
+            await browser.disconnect()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # OUTPUT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _safe_file(s: str) -> str:
-    return re.sub(r'[#:/\\?*"|<>]', "_", str(s))[:80]
-
-def _esc(s):
-    if not s and s != 0:
-        return ""
-    return (str(s)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&#39;"))
-
-def _rank_str(tier: int, rr: int) -> str:
-    if tier <= 0:
-        return "Unrated"
-    name = RANK_NAMES[tier] if tier < len(RANK_NAMES) else f"Rank {tier}"
-    return f"{name} — {rr} RR"
-
-def _cat_of(n: int) -> str:
-    if n <= 0:    return "0_skin"
-    if n <= 20:   return "1-20_skins"
-    if n <= 40:   return "20-40_skins"
-    if n <= 60:   return "40-60_skins"
-    if n <= 100:  return "60-100_skins"
-    return "100plus_skins"
-
-CAT_COLORS = {
-    "0_skin": "#9e9e9e",
-    "1-20_skins": "#f5a623",
-    "20-40_skins": "#2196f3",
-    "40-60_skins": "#9c27b0",
-    "60-100_skins": "#4caf50",
-    "100plus_skins": "#ff4655",
-    "error": "#ff5252"
-}
-CAT_LABELS = {
-    "0_skin": "0 Skin",
-    "1-20_skins": "1-20 Skins",
-    "20-40_skins": "20-40 Skins",
-    "40-60_skins": "40-60 Skins",
-    "60-100_skins": "60-100 Skins",
-    "100plus_skins": "100+ Skins",
-    "error": "Error"
-}
-
-def _account_html(d: dict) -> str:
-    cat   = d.get("_cat", "error")
-    color = CAT_COLORS.get(cat, "#8b978f")
-    label = CAT_LABELS.get(cat, cat)
-    tier  = d.get("current_tier", 0)
-    rr    = d.get("current_rr", 0)
-    vp = (d.get("vp") or 0); rp = (d.get("rp") or 0)
-    kc = (d.get("kc") or 0); fa = (d.get("fa") or 0)
-    banned = d.get("is_banned", False)
-
-    if banned:
-        badge = f'<span class="badge banned">{_esc(d.get("account_status","BANNED"))}</span>'
+def generate_account_html(r: Result) -> str:
+    """Tạo chi tiết tài khoản giống giao diện webapp."""
+    is_err = not r.ok or r.status in ("banned", "time_ban", "flagged", "error", "auth_fail")
+    if is_err:
+        cat_label = "Lỗi / Bị Ban"
+        cat_color = "#ff5252"
+    elif r.skins_count == 0:
+        cat_label = "0 Skins"
+        cat_color = "#8b978f"
+    elif r.skins_count <= 20:
+        cat_label = "1-20 Skins"
+        cat_color = "#4caf50"
+    elif r.skins_count <= 60:
+        cat_label = "20-60 Skins"
+        cat_color = "#2196f3"
+    elif r.skins_count <= 120:
+        cat_label = "60-120 Skins"
+        cat_color = "#ff9800"
     else:
-        badge = f'<span class="badge" style="COLOR">{label}</span>'
-    badge = badge.replace("COLOR", f'border-color:{color};color:{color}')
+        cat_label = "120+ Skins"
+        cat_color = "#e91e63"
 
-    banner = ""
-    if banned:
-        banner = f'<div style="background:rgba(183,28,28,.2);border:1px solid #b71c1c;border-radius:8px;padding:14px;margin-bottom:16px;color:#ff5252;font-weight:600">&#9888; {_esc(d.get("account_status","BANNED"))}</div>'
-
-    status = d.get("account_status", "Active")
-    status_html = '<span class="ok">Active</span>' if status == "Active" else f'<span class="bad">{_esc(status)}</span>'
-
-    css = """
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#0f1923;color:#ece8e1;font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh}
-header{background:#1a2634;border-bottom:2px solid #ff4655;padding:16px 24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
-.logo{width:36px;height:36px}
-header .brand{display:flex;align-items:center;gap:12px}
-header .brand .name{font-size:1.2em;font-weight:700;color:#ff4655;letter-spacing:1px}
-.badge{display:inline-block;padding:3px 12px;border-radius:12px;font-size:.8em;font-weight:700;border:1px solid COLOR;color:COLOR}
-.badge.banned{border-color:#ff5252;color:#ff5252}
-main{max-width:1100px;margin:0 auto;padding:20px 24px}
-.two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
-.card{background:#1a2634;border:1px solid #2a3a4a;border-radius:10px;padding:16px}
-.card h3{color:#ff4655;font-size:.72em;text-transform:uppercase;letter-spacing:.8px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid #2a3a4a}
-.row{display:flex;padding:7px 0;border-bottom:1px solid rgba(42,58,74,.3);font-size:.88em;gap:10px}
-.row:last-child{border-bottom:none}
-.row .l{color:#8b978f;min-width:130px;flex-shrink:0}
-.row .v{font-weight:600;color:#ece8e1;word-break:break-all}
-.row .v.sm{font-size:.75em}
-.ok,.bad{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.8em;font-weight:600}
-.ok{background:#1b5e20;color:#4caf50}
-.bad{background:#2a1a1a;color:#ff5252}
-.wg{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-bottom:12px}
-.wc{background:#0d1520;border:1px solid #2a3a4a;border-radius:8px;padding:10px;text-align:center}
-.wc .v{font-size:1.1em;font-weight:700;color:#ff4655}
-.wc .l{font-size:.68em;color:#8b978f;text-transform:uppercase;letter-spacing:.5px;margin-top:2px}
-footer{text-align:center;color:#8b978f;font-size:.78em;padding:20px;border-top:1px solid #2a3a4a;margin-top:20px}
-@media(max-width:700px){.two-col{grid-template-columns:1fr}.wg{grid-template-columns:1fr 1fr}}
-""".replace("COLOR", color)
-
-    title = f"{_esc(d.get('game_name','—'))}#{_esc(d.get('tag_line','—'))}"
-    now   = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    rank_name = RANK_NAMES[r.tier] if 0 <= r.tier < len(RANK_NAMES) else f"Rank {r.tier}"
+    rank_str = f"{rank_name} - {r.rr}RR" if r.tier > 0 else "—"
+    is_banned = r.status in ("banned", "time_ban")
+    
+    import html
+    game_name_esc = html.escape(r.game_name)
+    tag_line_esc = html.escape(r.tag_line)
+    puuid_esc = html.escape(r.puuid)
+    region_esc = html.escape(r.region.upper())
+    country_esc = html.escape(r.country.upper())
+    status_lbl_esc = html.escape(r.status_label)
+    
+    banned_banner = ""
+    if is_banned:
+        banned_banner = f'<div style="background:rgba(183,28,28,.2);border:1px solid #b71c1c;border-radius:8px;padding:14px;margin-bottom:16px;color:#ff5252;font-weight:600">⚠ Account bị: {status_lbl_esc}</div>'
+    
+    email_status = "Yes" if r.email_verified else "No"
+    phone_status = "Yes" if r.phone_verified else "No"
+    
+    status_badge = f"<span class='green-badge'>Active</span>" if r.status == "active" else f"<span class='red-badge'>{status_lbl_esc}</span>"
 
     return f"""<!DOCTYPE html>
 <html lang="vi">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title>
-<style>{css}</style>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{game_name_esc}#{tag_line_esc} - Valorant Checker</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0f1923;color:#ece8e1;font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh}}
+header{{background:#1a2634;border-bottom:2px solid #ff4655;padding:16px 24px;display:flex;align-items:center;justify-content:space-between}}
+header .brand{{display:flex;align-items:center;gap:12px}}
+header .brand .logo{{width:36px;height:36px}}
+header .brand .name{{font-size:1.2em;font-weight:700;color:#ff4655;letter-spacing:1px}}
+header .right{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}}
+main{{max-width:1100px;margin:0 auto;padding:20px 24px}}
+.two-col{{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}}
+.card{{background:#1a2634;border:1px solid #2a3a4a;border-radius:10px;padding:16px}}
+.card h3{{color:#ff4655;font-size:.72em;text-transform:uppercase;letter-spacing:.8px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid #2a3a4a}}
+.info-row{{display:flex;padding:7px 0;border-bottom:1px solid rgba(42,58,74,.3);font-size:.88em;gap:10px}}
+.info-row:last-child{{border-bottom:none}}
+.info-row .label{{color:#8b978f;min-width:130px;flex-shrink:0}}
+.info-row .val{{font-weight:600;color:#ece8e1;word-break:break-all}}
+.info-row .val.small{{font-size:.75em}}
+.green-badge{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.8em;font-weight:600;background:#1b5e20;color:#4caf50}}
+.red-badge{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.8em;font-weight:600;background:#2a1a1a;color:#ff5252}}
+.wallet-grid{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px}}
+.wallet-card{{background:#0d1520;border:1px solid #2a3a4a;border-radius:8px;padding:10px;text-align:center}}
+.wallet-card .val{{font-size:1.1em;font-weight:700;color:#ff4655}}
+.wallet-card .lbl{{font-size:.68em;color:#8b978f;text-transform:uppercase;letter-spacing:.5px;margin-top:2px}}
+.stat-row{{display:flex;gap:16px;padding-top:8px;border-top:1px solid #2a3a4a}}
+.stat-row .s{{font-size:.88em}}
+.stat-row .s .n{{font-weight:700;color:#ece8e1}}
+.stat-row .s .l{{color:#8b978f;font-size:.8em}}
+.cat-badge{{display:inline-block;padding:3px 12px;border-radius:12px;font-size:.8em;font-weight:700;border:1px solid {cat_color};color:{cat_color};background:transparent}}
+.cat-badge.error-badge{{border-color:#ff5252;color:#ff5252}}
+footer{{text-align:center;color:#8b978f;font-size:.78em;padding:20px;border-top:1px solid #2a3a4a;margin-top:20px}}
+footer a{{color:#ff4655;text-decoration:none}}
+@media(max-width:700px){{.two-col{{grid-template-columns:1fr}}.wallet-grid{{grid-template-columns:1fr 1fr}}}}
+</style>
 </head>
 <body>
 <header>
   <div class="brand">
-    <svg class="logo" viewBox="0 0 32 32" fill="none">
-      <circle cx="16" cy="16" r="16" fill="#ff4655"/>
-      <polygon points="16,6 22,12 16,18 10,12" fill="white"/>
-      <rect x="14" y="18" width="4" height="8" fill="white"/>
-    </svg>
-    <span class="name">{_esc(d.get('game_name','—'))}#{_esc(d.get('tag_line','—'))}</span>
+    <svg class="logo" viewBox="0 0 32 32" fill="none"><circle cx="16" cy="16" r="16" fill="#ff4655"/><polygon points="16,6 22,12 16,18 10,12" fill="white"/><rect x="14" y="18" width="4" height="8" fill="white"/></svg>
+    <span class="name">{game_name_esc}#{tag_line_esc}</span>
   </div>
-  <div style="display:flex;align-items:center;gap:10px">
-    {badge}
-    <span style="font-size:.85em;color:#8b978f">Level {d.get('level','—')}</span>
+  <div class="right">
+    {f'<span class="cat-badge error-badge">{status_lbl_esc}</span>' if is_banned else f'<span class="cat-badge">{cat_label}</span>'}
+    <span style="font-size:.85em;color:#8b978f">Level {r.level}</span>
   </div>
 </header>
 <main>
-{banner}
-<div class="two-col">
-  <div class="card">
-    <h3>Thong tin tai khoan</h3>
-    <div class="row"><span class="l">PUUID</span><span class="v sm">{_esc(d.get('puuid',''))}</span></div>
-    <div class="row"><span class="l">Level</span><span class="v">{d.get('level','—')}</span></div>
-    <div class="row"><span class="l">Region</span><span class="v">{_esc(str(d.get('region','')).upper())}</span></div>
-    <div class="row"><span class="l">Country</span><span class="v">{_esc(str(d.get('country','')).upper())}</span></div>
-    <div class="row"><span class="l">Email Verified</span><span class="v">{"Yes" if d.get("email_verified") else "No"}</span></div>
-    <div class="row"><span class="l">Phone Verified</span><span class="v">{"Yes" if d.get("phone_verified") else "No"}</span></div>
-    <div class="row"><span class="l">Account Created</span><span class="v">{_esc(d.get('created_at','—'))}</span></div>
-    <div class="row"><span class="l">Status</span><span class="v">{status_html}</span></div>
-  </div>
-  <div class="card">
-    <h3>Wallet & Rank</h3>
-    <div class="wg">
-      <div class="wc"><div class="v">{vp:,}</div><div class="l">VP</div></div>
-      <div class="wc"><div class="v">{rp:,}</div><div class="l">RP</div></div>
-      <div class="wc"><div class="v">{kc:,}</div><div class="l">KC</div></div>
-      <div class="wc"><div class="v">{fa:,}</div><div class="l">FA</div></div>
+  {banned_banner}
+  <div class="two-col">
+    <div class="card">
+      <h3>Thông tin tài khoản</h3>
+      <div class="info-row"><span class="label">PUUID</span><span class="val small">{puuid_esc}</span></div>
+      <div class="info-row"><span class="label">Level</span><span class="val">{r.level}</span></div>
+      <div class="info-row"><span class="label">Region</span><span class="val">{region_esc}</span></div>
+      <div class="info-row"><span class="label">Country</span><span class="val">{country_esc}</span></div>
+      <div class="info-row"><span class="label">Email Verified</span><span class="val">{email_status}</span></div>
+      <div class="info-row"><span class="label">Phone Verified</span><span class="val">{phone_status}</span></div>
+      <div class="info-row"><span class="label">Account Created</span><span class="val">{r.created_at}</span></div>
+      <div class="info-row"><span class="label">Status</span><span class="val">{status_badge}</span></div>
     </div>
-    <div class="row"><span class="l">Current Rank</span><span class="v">{_esc(_rank_str(tier, rr))}</span></div>
-    <div class="row"><span class="l">Skin Levels</span><span class="v">{d.get('skins_count', 0)}</span></div>
+    <div class="card">
+      <h3>Wallet & Rank</h3>
+      <div class="wallet-grid">
+        <div class="wallet-card"><div class="val">{r.vp:,}</div><div class="lbl">VP</div></div>
+        <div class="wallet-card"><div class="val">{r.rp:,}</div><div class="lbl">RP</div></div>
+        <div class="wallet-card"><div class="val">{r.kc:,}</div><div class="lbl">KC</div></div>
+      </div>
+      <div class="info-row"><span class="label">Current Rank</span><span class="val">{rank_str}</span></div>
+      <div class="stat-row">
+        <div class="s"><span class="n">{r.skins_count}</span> <span class="l">Skins</span></div>
+        <div class="s"><span class="n">{region_esc}</span> <span class="l">Region</span></div>
+      </div>
+    </div>
   </div>
-</div>
-<div style="text-align:center;color:#8b978f;font-size:.78em;margin-top:12px">Checked: {now}</div>
+  <div style="text-align:center;color:#8b978f;font-size:.78em;margin-top:12px">
+    Checked: {datetime.now().strftime("%d/%m/%Y %H:%M:%S")}
+  </div>
 </main>
-<footer>Valorant Checker — Auto Generated</footer>
+<footer>Valorant Checker — Generated automatically</footer>
 </body>
 </html>"""
 
-def _index_html(results: list[Result]) -> str:
-    cats: dict[str, list[dict]] = {
-        "0_skin": [], "1-20_skins": [], "20-40_skins": [],
-        "40-60_skins": [], "60-100_skins": [], "100plus_skins": [], "error": []
-    }
+
+def save_results(results: list[Result]):
+    """Lưu kết quả ra HTML + phân loại theo skin count."""
+    ts = datetime.now().strftime("%d%m%Y_%H%M%S")
+    run_dir = OUTPUT_DIR / f"check_{ts}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    
+    # ── Phân loại tài khoản ──
+    def _is_error(r: Result) -> bool:
+        return not r.ok or r.status in ("banned", "time_ban", "flagged", "error", "auth_fail")
+    
+    cat_error = [r for r in results if _is_error(r)]
+    good = [r for r in results if not _is_error(r)]
+    cat_0 = [r for r in good if r.skins_count == 0]
+    cat_1_20 = [r for r in good if 1 <= r.skins_count <= 20]
+    cat_21_60 = [r for r in good if 21 <= r.skins_count <= 60]
+    cat_61_120 = [r for r in good if 61 <= r.skins_count <= 120]
+    cat_120plus = [r for r in good if r.skins_count > 120]
+    
+    categories = [
+        ("0_skins", "0 skins", cat_0, "#8b978f"),
+        ("1-20_skins", "1-20 skins", cat_1_20, "#4caf50"),
+        ("20-60_skins", "20-60 skins", cat_21_60, "#2196f3"),
+        ("60-120_skins", "60-120 skins", cat_61_120, "#ff9800"),
+        ("120+_skins", "120+ skins", cat_120plus, "#e91e63"),
+        ("error", "error", cat_error, "#ff5252"),
+    ]
+    
+    # Map kết quả tới tên thư mục phân loại để lưu file chi tiết
+    result_to_cat_folder = {}
+    
+    # Lưu file phân loại (.txt) và tạo thư mục tương ứng
+    logger.info("Saving categorized results to folders...")
+    for fname, label, cat_list, _ in categories:
+        if cat_list:
+            cat_dir = run_dir / fname
+            cat_dir.mkdir(parents=True, exist_ok=True)
+            
+            fpath = cat_dir / f"{fname}.txt"
+            lines = [f"{r.username}:{r.password}" for r in cat_list]
+            fpath.write_text("\n".join(lines), encoding="utf-8")
+            logger.info(f"  Saved {len(cat_list)} accounts to {fname}/{fname}.txt")
+            
+            for r in cat_list:
+                result_to_cat_folder[r.username] = fname
+            
+    # Lưu file chi tiết HTML từng account thành công vào đúng thư mục phân loại
     for r in results:
-        d = r.to_dict()
         if r.ok:
-            d["_cat"] = _cat_of(r.skins_count)
-            cats[d["_cat"]].append(d)
+            cat_folder = result_to_cat_folder.get(r.username, "error")
+            cat_dir = run_dir / cat_folder
+            cat_dir.mkdir(parents=True, exist_ok=True)
+            
+            import re
+            detail_fname = f"{r.game_name}_{r.tag_line}.html"
+            detail_fname = re.sub(r'[\\/*?:"<>|]', "", detail_fname)
+            detail_path = cat_dir / detail_fname
+            detail_html = generate_account_html(r)
+            detail_path.write_text(detail_html, encoding="utf-8")
+    
+    active = [r for r in results if r.ok and r.status == "active"]
+    
+    rows = ""
+    for i, r in enumerate(results, 1):
+        rank_name = RANK_NAMES[r.tier] if 0 <= r.tier < len(RANK_NAMES) else f"Rank {r.tier}"
+        rank_str = f"{rank_name} - {r.rr}RR" if r.tier > 0 else "Unrated"
+        
+        if r.status == "active":
+            cls = "ok"
+        elif r.status in ("banned", "time_ban"):
+            cls = "banned"
+        elif r.status == "flagged":
+            cls = "flagged"
         else:
-            d["_cat"] = "error"
-            cats["error"].append(d)
-
-    def cat_section(cat_key: str, results_list: list[dict]) -> str:
-        if not results_list:
-            return ""
-        color = CAT_COLORS.get(cat_key, "#8b978f")
-        label = CAT_LABELS.get(cat_key, cat_key)
-        rows = ""
-        for i, d in enumerate(results_list, 1):
-            rank = _esc(d.get("rank_str","—"))
-            vp   = f"{d.get('vp',0):,}"
-            skins = d.get("skins_count", "—")
-            status = d.get("account_status", "Active")
-            status_color = "#4caf50" if status == "Active" else "#ff5252"
-            rows += f"""<tr>
-  <td style="text-align:center;color:{color};font-weight:700">{i}</td>
-  <td><strong>{_esc(d.get('game_name','—'))}#{_esc(d.get('tag_line','—'))}</strong></td>
-  <td>{d.get('level','—')}</td>
-  <td style="color:#ff4655;font-weight:700">{vp}</td>
-  <td>{skins}</td>
-  <td><span style="color:{status_color};font-weight:600">{_esc(str(status))}</span></td>
-  <td>{_esc(d.get('region','').upper())}</td>
-</tr>"""
-        return f"""<div style="margin-bottom:28px">
-<h2 style="font-size:.8em;text-transform:uppercase;letter-spacing:.5px;color:{color};margin-bottom:10px;display:flex;align-items:center;gap:8px">
-  <span style="width:10px;height:10px;border-radius:50%;background:{color};display:inline-block"></span>
-  {label} ({len(results_list)})
-</h2>
-<div style="overflow-x:auto">
-<table style="width:100%;border-collapse:separate;border-spacing:0 4px">
-  <thead>
-    <tr style="color:#8b978f;font-size:.7em;text-transform:uppercase;letter-spacing:.5px">
-      <th style="text-align:center;padding:6px 10px">#</th>
-      <th style="padding:6px 10px;text-align:left">Account</th>
-      <th style="padding:6px 10px;text-align:left">Level</th>
-      <th style="padding:6px 10px;text-align:left">VP</th>
-      <th style="padding:6px 10px;text-align:left">Skins</th>
-      <th style="padding:6px 10px;text-align:left">Status</th>
-      <th style="padding:6px 10px;text-align:left">Region</th>
-    </tr>
-  </thead>
-  <tbody>{rows}</tbody>
-</table>
-</div>
-</div>"""
-
-    summary = ""
-    for cat_key in ["0_skin", "1-20_skins", "20-40_skins", "40-60_skins", "60-100_skins", "100plus_skins", "error"]:
-        n = len(cats[cat_key])
-        if n:
-            color = CAT_COLORS.get(cat_key, "#8b978f")
-            label = CAT_LABELS.get(cat_key, cat_key)
-            summary += f'<div style="background:#1a2634;border:1px solid {color};border-radius:10px;padding:12px 18px;text-align:center"><div style="font-size:1.4em;font-weight:700;color:{color}">{n}</div><div style="font-size:.65em;color:{color};opacity:.8;text-transform:uppercase">{label}</div></div>'
-
-    return f"""<!DOCTYPE html>
+            cls = "error"
+            
+        detail_link = "—"
+        if r.ok:
+            cat_folder = result_to_cat_folder.get(r.username, "error")
+            import re
+            detail_fname = f"{r.game_name}_{r.tag_line}.html"
+            detail_fname = re.sub(r'[\\/*?:"<>|]', "", detail_fname)
+            detail_link = f'<a href="{cat_folder}/{detail_fname}" target="_blank" style="color:#ff4655;font-weight:bold;text-decoration:none">Xem</a>'
+        
+        rows += f"""
+        <tr>
+            <td>{i}</td>
+            <td>{r.username}</td>
+            <td>{r.game_name}#{r.tag_line}</td>
+            <td>{r.level}</td>
+            <td style="color:#ff4655">{rank_str}</td>
+            <td>{r.vp:,}</td>
+            <td>{r.kc:,}</td>
+            <td>{r.skins_count}</td>
+            <td class="{cls}">{r.status_label}</td>
+            <td>{detail_link}</td>
+        </tr>"""
+    
+    # Tạo HTML stats cho các danh mục phân loại
+    cat_stats_html = ""
+    for _, label, cat_list, color in categories:
+        cat_stats_html += f'        <div class="stat"><div class="n" style="color:{color}">{len(cat_list)}</div><div class="l">{label}</div></div>\n'
+    
+    html = f"""<!DOCTYPE html>
 <html lang="vi">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Valorant Bulk Check — {datetime.now():%d/%m/%Y %H:%M}</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:#0f1923;color:#ece8e1;font-family:'Segoe UI',system-ui,sans-serif;padding:20px}}
-h1{{color:#ff4655;font-size:1.3em;margin-bottom:16px;padding-bottom:10px;border-bottom:2px solid #ff4655}}
-.summary{{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:28px}}
-table tr:hover td{{background:#243447}}
-td{{background:#1a2634;padding:8px 10px;font-size:.85em;border-radius:4px}}
-footer{{text-align:center;color:#5a6670;font-size:.75em;padding:20px;border-top:1px solid #2a3a4a;margin-top:20px}}
-</style>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Valorant Check - {datetime.now():%d/%m/%Y %H:%M}</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ font-family: 'Segoe UI', system-ui, sans-serif; background: #0f1923; color: #ece8e1; padding: 20px; }}
+        h1 {{ color: #ff4655; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 2px solid #ff4655; }}
+        h2 {{ color: #ff4655; margin: 25px 0 15px 0; font-size: 1.2em; }}
+        .stats {{ display: flex; gap: 15px; margin-bottom: 20px; flex-wrap: wrap; }}
+        .stat {{ background: #1a2634; padding: 15px 25px; border-radius: 10px; text-align: center; min-width: 100px; }}
+        .stat .n {{ font-size: 2em; font-weight: bold; color: #ff4655; }}
+        .stat .l {{ color: #8b978f; font-size: 0.75em; text-transform: uppercase; }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th {{ text-align: left; padding: 12px; background: #1a2634; color: #8b978f; font-size: 0.75em; text-transform: uppercase; }}
+        td {{ padding: 12px; background: #1a2634; margin-bottom: 4px; border-radius: 4px; }}
+        tr:hover td {{ background: #243447; }}
+        .ok {{ color: #4caf50; }}
+        .banned {{ color: #ff5252; }}
+        .flagged {{ color: #ff9800; }}
+        .error {{ color: #ff5252; }}
+        table a:hover {{ text-decoration: underline !important; }}
+    </style>
 </head>
 <body>
-<h1>Valorant Bulk Check — {datetime.now().strftime('%d/%m/%Y %H:%M')}</h1>
-<div class="summary">{summary}</div>
-{''.join(cat_section(k, v) for k, v in cats.items() if v)}
-<footer>Generated by Valorant Checker</footer>
+    <h1>Valorant Account Check - {datetime.now():%d/%m/%Y %H:%M}</h1>
+    
+    <div class="stats">
+        <div class="stat"><div class="n">{len(results)}</div><div class="l">Total</div></div>
+        <div class="stat"><div class="n" style="color:#4caf50">{len(active)}</div><div class="l">Active</div></div>
+        <div class="stat"><div class="n" style="color:#ff5252">{len(results)-len(active)}</div><div class="l">Errors/Banned</div></div>
+    </div>
+    
+    <h2>📊 Skin Categories</h2>
+    <div class="stats">
+{cat_stats_html}    </div>
+    
+    <table>
+        <thead>
+            <tr>
+                <th>#</th><th>Username</th><th>Name</th><th>Lv</th><th>Rank</th>
+                <th>VP</th><th>KC</th><th>Skins</th><th>Status</th><th>Chi tiết</th>
+            </tr>
+        </thead>
+        <tbody>{rows}
+        </tbody>
+    </table>
+    
+    <p style="color:#5a6670;font-size:0.75em;margin-top:20px;text-align:center">
+        Generated by Valorant Checker - GoLogin Edition
+    </p>
 </body>
 </html>"""
+    
+    path = run_dir / "index.html"
+    path.write_text(html, encoding="utf-8")
+    logger.info(f"Saved: {path}")
 
-def _save_outputs(results: list[Result]):
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%d%m%Y_%H%M%S")
-    index_path = OUTPUT_DIR / f"index_{timestamp}.html"
-
-    index_path.write_text(_index_html(results), encoding="utf-8")
-
-    # Save ALL accounts — active, banned, suspended, error
-    # Group by status
-    status_dirs: dict[str, Path] = {
-        "active":     OUTPUT_DIR / "01_active",
-        "perm_ban":   OUTPUT_DIR / "02_perm_ban",
-        "suspended":   OUTPUT_DIR / "03_suspended",
-        "wrong_password": OUTPUT_DIR / "04_wrong_password",
-        "mfa_required":   OUTPUT_DIR / "05_mfa_required",
-        "captcha_required": OUTPUT_DIR / "06_captcha_required",
-        "auth_fail":  OUTPUT_DIR / "07_auth_fail",
-        "error":      OUTPUT_DIR / "08_error",
-    }
-    for d in status_dirs.values():
-        d.mkdir(parents=True, exist_ok=True)
-
-    counts: dict[str, int] = {}
-    for r in results:
-        status = r.status if r.status in status_dirs else "error"
-        if status not in counts:
-            counts[status] = 0
-        counts[status] += 1
-
-        # Filename: prefer game_name if available, else username
-        if r.game_name:
-            safe_name = _safe_file(r.game_name)
-            safe_tag  = _safe_file(r.tag_line) if r.tag_line else "no_tag"
-            fname = f"{safe_name}_{safe_tag}.html"
-        else:
-            safe_user = _safe_file(r.username)
-            fname = f"{safe_user}_error.html"
-
-        # Use skins folder for active, status folder for others
-        if r.ok:
-            cat = _cat_of(r.skins_count)
-            out_dir = OUTPUT_DIR / cat
-            out_dir.mkdir(exist_ok=True)
-        else:
-            out_dir = status_dirs.get(status, OUTPUT_DIR / "08_error")
-
-        path = out_dir / fname
-        d = r.to_dict()
-        path.write_text(_account_html(d), encoding="utf-8")
-
-    total_saved = sum(counts.values())
-    parts = [f"{v} {k.replace('_',' ')}" for k, v in counts.items() if v > 0]
-    detail = " | ".join(parts) if parts else "0"
-    logger.success(f"  Da luu {total_saved} file HTML vao: {OUTPUT_DIR}")
-    logger.info(f"    Chi tiet: {detail}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _main():
-    t0_all = time.time()
-
-    # ── Load accounts ──────────────────────────────────────────────────────────
+def load_accounts() -> list[Account]:
+    """Load accounts từ file."""
     if not ACCOUNTS_FILE.exists():
-        logger.error(f"File khong ton tai: {ACCOUNTS_FILE}")
-        logger.error("Tao file voi dinh dang: username:password[:region]")
-        sys.exit(1)
+        logger.error(f"File not found: {ACCOUNTS_FILE}")
+        ACCOUNTS_FILE.write_text("""# GoLogin Account Format
+# username:password:region:proxy:profile_id:ws_url
+#
+# Ví dụ:
+# acc1@gmail.com:pass123:ap:http://user:pass@proxy:8080:profile123:
+# acc2@gmail.com:pass456:eu::profile456:ws://localhost:9222
+#
+# - region: ap, na, eu, kr (mặc định: ap)
+# - proxy: http://user:pass@host:port (để trống nếu không dùng)
+# - profile_id: GoLogin Profile ID (từ app)
+# - ws_url: WebSocket URL (để trống = tự động tìm)
+""", encoding="utf-8")
+        return []
+    
+    accounts = []
+    for line in ACCOUNTS_FILE.read_text(encoding="utf-8").splitlines():
+        acc = Account.parse(line)
+        if acc:
+            accounts.append(acc)
+    
+    return accounts
 
-    # ── Load proxies (round-robin) ─────────────────────────────────────────────
-    # Format in proxies.txt: host:port:user:pass
-    # Converts to: http://user:pass@host:port
-    proxies: list[str] = []
-    if PROXIES_FILE.exists():
-        for line in PROXIES_FILE.read_text(encoding="utf-8").splitlines():
-            p = line.strip()
-            if not p or p.startswith("#"):
-                continue
-            parts = p.split(":")
-            if len(parts) == 4:
-                # host:port:user:pass
-                host = parts[0].strip()
-                port = parts[1].strip()
-                user = parts[2].strip()
-                pw   = parts[3].strip()
-                proxies.append(f"http://{user}:{pw}@{host}:{port}")
-            elif len(parts) >= 2:
-                # host:port or host:port:user:pass or http://host:port
-                if p.startswith("http"):
-                    proxies.append(p)
-                elif len(parts) >= 4:
-                    # host:port:user:pass format
-                    host = parts[0].strip()
-                    port = parts[1].strip()
-                    user = parts[2].strip()
-                    pwd = ":".join(parts[3:]).strip()
-                    proxies.append(f"http://{user}:{pwd}@{host}:{port}")
-                else:
-                    proxies.append(f"http://{parts[0].strip()}:{parts[1].strip()}")
-        if proxies:
-            logger.info(f"Loaded {len(proxies)} proxy from proxies.txt")
 
-    accounts: list[dict] = []
-    for i, line in enumerate(ACCOUNTS_FILE.read_text(encoding="utf-8").splitlines()):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if ":" not in line:
-            continue
-        # Format: username:password[:region]
-        # Use maxsplit=1 so password can contain colons/special chars
-        parts = line.split(":", 1)
-        username = parts[0].strip()
-        rest = parts[1] if len(parts) > 1 else ""
-        # rest is "password[:region]" — split on first : for region
-        if ":" in rest:
-            pw, region = rest.split(":", 1)
-            password = pw.strip()
-            region = region.strip().lower()
-        else:
-            password = rest.strip()
-            region = "ap"
-        # Assign proxy round-robin
-        proxy = proxies[i % len(proxies)] if proxies else ""
-        if username and password:
-            accounts.append({"username": username, "password": password, "region": region, "proxy": proxy})
-            if proxy:
-                short = proxy.split("@")[-1] if "@" in proxy else proxy
-                logger.debug(f"  [config] {username} | region={region} | proxy={short}")
+def load_proxies() -> list[ProxyInfo]:
+    """Load danh sách proxy từ proxies.txt.
+    
+    Format mỗi dòng: ip:port:user:pass hoặc ip:port
+    Proxy được gán round-robin cho các account chưa có proxy.
+    """
+    if not PROXIES_FILE.exists():
+        logger.warning(f"Proxies file not found: {PROXIES_FILE}")
+        return []
+    proxies = []
+    for line in PROXIES_FILE.read_text(encoding="utf-8").splitlines():
+        p = ProxyInfo.parse(line)
+        if p:
+            proxies.append(p)
+    return proxies
 
+
+async def main():
+    logger.info("=" * 55)
+    logger.info("  VALORANT CHECKER - GoLogin Edition")
+    logger.info("=" * 55)
+    logger.info(f"  Concurrency: {CONCURRENCY}")
+    logger.info(f"  Output: {OUTPUT_DIR}")
+    logger.info("=" * 55)
+    
+    # Load accounts
+    accounts = load_accounts()
     if not accounts:
-        logger.error("Khong co tai khoan nao trong file.")
-        sys.exit(1)
-
-    # ── Get client version ────────────────────────────────────────────────────
-    version = await _get_version()
-    logger.info(f"Riot client version: {version}")
-    logger.info(f"Concurrency: {CONCURRENCY} | Accounts: {len(accounts)}")
-
-    # ── Category stats ────────────────────────────────────────────────────────
-    cat = {"active":0,"perm_ban":0,"suspended":0,"error":0,
-           "wrong_password":0,"mfa_required":0,"captcha_required":0,"auth_fail":0}
-
+        logger.error("No accounts found - check accounts.txt")
+        return
+    
+    logger.info(f"Loaded {len(accounts)} accounts")
+    
+    # Load proxies từ proxies.txt
+    proxies = load_proxies()
+    if proxies:
+        logger.info(f"Loaded {len(proxies)} proxies from proxies.txt")
+    else:
+        logger.warning("No proxies loaded - all accounts will use direct connection")
+    
+    # Load Valorant skins map once for deduplication
+    logger.info("Loading Valorant skins mapping from API...")
+    await load_valorant_skins_map()
+    
+    # Gán proxy round-robin cho các account chưa có proxy
     sem = asyncio.Semaphore(CONCURRENCY)
-
-    # BUG FIX (Bug 2): true queue-based concurrency. Previously all tasks were
-    # created and started immediately — asyncio.as_completed just reordered results,
-    # all tasks were running in the background. Now: semaphore is acquired FIRST,
-    # then stagger delay, then actual work. This guarantees at most CONCURRENCY
-    # tasks are EVER running at the same time, and when 1 finishes the next one
-    # waits for its slot before starting, not after.
-    async def _process_one_queued(idx: int, acc: dict) -> Result:
-        await sem.acquire()  # block here until a slot opens
-        try:
-            await asyncio.sleep(idx * random.uniform(DELAY_MIN, DELAY_MAX))
-            return await _process_one(
-                username=acc["username"],
-                password=acc["password"],
-                region=acc["region"],
-                version=version,
-                proxy=acc.get("proxy", ""),
-                sem=sem,
-            )
-        finally:
-            sem.release()
-
-    tasks = [
-        _process_one_queued(idx, acc)
-        for idx, acc in enumerate(accounts)
-    ]
-
-    # ── Run and collect results ────────────────────────────────────────────────
-    results: list[Result] = []
-    for coro in asyncio.as_completed(tasks):
-        try:
-            r = await coro
-        except Exception as e:
-            logger.error(f"  Task exception: {e}")
-            continue
-        results.append(r)
-
-    # ── Count categories ───────────────────────────────────────────────────────
-    for r in results:
-        if r.status == "auth_fail":
-            err = r.error or ""
-            if "mfa" in err:
-                cat["mfa_required"] = cat.get("mfa_required", 0) + 1
-            elif "wrong_password" in err or "password" in err.lower():
-                cat["wrong_password"] = cat.get("wrong_password", 0) + 1
-            elif "captcha" in err:
-                cat["captcha_required"] = cat.get("captcha_required", 0) + 1
-            else:
-                cat["auth_fail"] = cat.get("auth_fail", 0) + 1
-        else:
-            cat[r.status] = cat.get(r.status, 0) + 1
-
-    # ── Sort results: active first, then by skins ─────────────────────────────
-    results.sort(key=lambda r: (r.ok, -(r.skins_count or 0)), reverse=True)
-
-    # ── Save outputs ───────────────────────────────────────────────────────────
-    try:
-        _save_outputs(results)
-    except Exception as e:
-        logger.error(f"Loi luu file: {e}")
-
-    # ── Summary ────────────────────────────────────────────────────────────────
-    total = len(results)
-    elapsed = time.time() - t0_all
+    tasks = []
+    for i, acc in enumerate(accounts):
+        pi = None
+        if proxies and not acc.proxy:
+            pi = proxies[i % len(proxies)]
+            acc.proxy = pi.http_url  # Set cho httpx API calls
+        tasks.append(process_account(acc, sem, proxy_info=pi))
+    results = await asyncio.gather(*tasks)
+    
+    # Save
+    save_results(list(results))
+    
+    # Summary
+    active = sum(1 for r in results if r.ok and r.status == "active")
+    banned = sum(1 for r in results if r.status in ("banned", "time_ban"))
+    errors = sum(1 for r in results if not r.ok)
     logger.info("")
-    logger.info("═" * 56)
-    logger.info("   KET QUA KIEM TRA")
-    logger.info("═" * 56)
-    logger.info(f"  Tong tai khoan:  {total}")
-    logger.info(f"  Thoi gian:      ~{elapsed:.1f}s")
-    logger.info("")
-    logger.info(f"  \033[92m[HOAT DONG]\033[0m")
-    logger.info(f"    Active:        {cat.get('active', 0)}")
-
-    logger.info("")
-    logger.info(f"  \033[91m[BI CAM / KHOA]\033[0m")
-    logger.info(f"    Cam vinh vien: {cat.get('perm_ban', 0)}")
-    logger.info(f"    Bi khoa tam:   {cat.get('suspended', 0)}")
-
-    logger.info("")
-    logger.info(f"  \033[93m[LOI DANG NHAP]\033[0m")
-    logger.info(f"    Sai mat khau:  {cat.get('wrong_password', 0)}")
-    logger.info(f"    Can MFA:       {cat.get('mfa_required', 0)}")
-    logger.info(f"    Captcha:       {cat.get('captcha_required', 0)}")
-    logger.info(f"    Auth fail:     {cat.get('auth_fail', 0)}")
-    logger.info(f"    Loi khac:      {cat.get('error', 0)}")
-    logger.info("")
-    logger.info("═" * 56)
-    logger.info("XONG!")
-
-# ── interactive menu ──────────────────────────────────────────────────────────
-
-def _show_menu():
-    print("""
-==============================================================
-          VALORANT CHECKER - Python Edition
-==============================================================
-
-  1.  Browser Mode (Playwright)  [CHINH THUC - TOT NHAT]
-      -> Dung Chrome that, tran captcha tot hon
-      -> Proxy rieng cho moi account
-      -> Khuyen nghi: 1-3 concurrency
-
-  2.  HTTP Mode (API)
-      -> Nhanh hon, khong can mo trinh duyet
-      -> De bi captcha hon
-      -> Khuyen nghi: 3-5 concurrency
-
-  3.  Retry Captcha Accounts
-      -> Chay lai nhung account bi captcha tu truoc
-      -> Dung proxy xoay khac
-
-  4.  Exit
-
-==============================================================
-""")
-
-def _get_choice() -> int:
-    while True:
-        try:
-            c = int(input("  Nhap lua chon (1-4): ").strip())
-            if 1 <= c <= 4:
-                return c
-            print("  Vui long nhap so tu 1-4")
-        except ValueError:
-            print("  Vui long nhap so tu 1-4")
-
-def _get_concurrency(prompt: str, default: int) -> int:
-    while True:
-        try:
-            val = input(f"  {prompt} [mac dinh {default}]: ").strip()
-            if not val:
-                return default
-            c = int(val)
-            if 1 <= c <= 20:
-                return c
-            print("  Vui long nhap so tu 1-20")
-        except ValueError:
-            print("  Vui long nhap so")
-
-# ── captcha solver ─────────────────────────────────────────────────────────────
-
-CAPTCHA_API_KEY = os.getenv("2CAPTCHA_API_KEY", "")
-
-def _solve_captcha_2captcha(site_key: str, page_url: str, proxy: str = "") -> str | None:
-    """
-    Solve reCAPTCHA v2 via 2captcha.com.
-    Returns g-recaptcha-response token or None on failure.
-    """
-    if not CAPTCHA_API_KEY:
-        return None
-
-    try:
-        import urllib.request
-        import urllib.parse
-
-        # Submit
-        data = {
-            "googlekey": site_key,
-            "pageurl": page_url,
-            "method": "userrecaptcha",
-            "key": CAPTCHA_API_KEY,
-            "json": "1",
-        }
-        if proxy:
-            data["proxy"] = proxy
-            data["proxytype"] = "HTTP"
-
-        req = urllib.request.Request(
-            "http://2captcha.com/in.php",
-            data=urllib.parse.urlencode(data).encode(),
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = _json.loads(resp.read())
-
-        if result.get("status") != 1:
-            logger.warning(f"  [captcha] Submit failed: {result}")
-            return None
-
-        captcha_id = result.get("request")
-        logger.info(f"  [captcha] Submitted, ID: {captcha_id}")
-
-        # Poll for result (max 120s)
-        for _ in range(60):
-            import time as _time
-            _time.sleep(2)
-            try:
-                req2 = urllib.request.Request(
-                    f"http://2captcha.com/res.php?key={CAPTCHA_API_KEY}&action=get&id={captcha_id}&json=1"
-                )
-                with urllib.request.urlopen(req2, timeout=10) as resp2:
-                    res2 = _json.loads(resp2.read())
-                if res2.get("status") == 1:
-                    token = res2.get("request")
-                    logger.info(f"  [captcha] Solved!")
-                    return token
-                if res2.get("request") != "CAPCHA_NOT_READY":
-                    logger.warning(f"  [captcha] Error: {res2}")
-                    return None
-            except Exception as e:
-                logger.debug(f"  [captcha] Poll error: {e}")
-
-        logger.warning("  [captcha] Timeout after 120s")
-        return None
-    except Exception as e:
-        logger.warning(f"  [captcha] 2captcha error: {e}")
-        return None
+    logger.info("=" * 55)
+    logger.info("  SUMMARY")
+    logger.info("=" * 55)
+    logger.info(f"  Total: {len(results)}")
+    logger.info(f"  Active: {active}")
+    logger.info(f"  Banned: {banned}")
+    logger.info(f"  Errors: {errors}")
+    logger.info(f"  Output: {OUTPUT_DIR}")
+    logger.info("=" * 55)
+    logger.info("  DONE!")
 
 
 if __name__ == "__main__":
-    import asyncio as _asyncio
-    if SKIP_MENU:
-        _asyncio.run(_main())
-    else:
-        _show_menu()
-        choice = _get_choice()
-
-        if choice == 4:
-            print("  Thoat.")
-            sys.exit(0)
-
-        if choice == 1:
-            conc = _get_concurrency("Concurrency (browser mode)", 2)
-        else:
-            conc = _get_concurrency("Concurrency (HTTP mode)", 4)
-
-        n_proxies = 0
-        if PROXIES_FILE.exists():
-            lines = [l for l in PROXIES_FILE.read_text(encoding="utf-8").splitlines()
-                     if l.strip() and not l.strip().startswith("#")]
-            n_proxies = len(lines)
-        print(f"  Proxy: {n_proxies} duoc load ({n_proxies if n_proxies > 0 else '0 - dung IP may'})")
-
-        captcha_key = os.getenv("2CAPTCHA_API_KEY", "")
-        if not captcha_key:
-            print("  [INFO] 2Captcha API key chua dat (set 2CAPTCHA_API_KEY env)")
-            print("         Neu can auto-solve captcha, lay key tai: https://2capt.com")
-            print("         VD: set 2CAPTCHA_API_KEY=your_key_here")
-
-        browser_flag = "--browser" if choice == 1 else ""
-        cmd = f'python main.py --cli --concurrency {conc} {browser_flag}'.strip()
-        print(f"\n  ▶ Chay: {cmd}\n")
-        import subprocess
-        result = subprocess.run(cmd, shell=True)
-        sys.exit(result.returncode)
+    asyncio.run(main())

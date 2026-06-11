@@ -1,6 +1,15 @@
-playwright
-httpx
-gspread
-google-auth
-python-dotenv
-loguru
+# Valorant Checker Dependencies
+
+# Core
+playwright>=1.40.0
+httpx>=0.25.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+loguru>=0.7.0
+
+# Optional: GoLogin SDK (nếu dùng API token)
+# pip install pygologin
+
+# Optional: Google Sheets (nếu cần export)
+# gspread>=5.0.0
+# google-auth>=2.0.0

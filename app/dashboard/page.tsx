@@ -142,7 +142,7 @@ function DashboardContent() {
             fetch("/api/riot/mmr", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ accessToken: currentAccessToken, entitlementToken: currentEntitlementToken, version: ver, puuid, region }),
+              body: JSON.stringify({ accessToken: currentAccessToken, entitlementToken: currentEntitlementToken, version: ver, puuid, region, accountLevel }),
             }),
             fetch("/api/riot/wallet", {
               method: "POST",
@@ -199,7 +199,7 @@ function DashboardContent() {
         // MMR
         if (mmrRes.status === "fulfilled" && mmrRes.value.ok) {
           const data = await mmrRes.value.json();
-          console.log("MMR response:", data);
+          console.log("MMR response:", JSON.stringify(data));
           setRank(data);
         } else if (mmrRes.status === "rejected") {
           console.error("MMR rejected:", mmrRes.reason);
@@ -262,10 +262,21 @@ function DashboardContent() {
 
         // Account XP
         if (accountXpRes.status === "fulfilled" && accountXpRes.value.ok) {
-          const data = await accountXpRes.value.json();
-          console.log("Account XP response:", data);
-          const level = data?.Progress?.Level ?? data?.Level ?? 0;
-          setAccountLevel(typeof level === "number" ? level : 0);
+          const data = await accountXpRes.value.clone().json();
+          console.log("Account XP response:", JSON.stringify(data));
+          // Extract level from Progress — handle both nested and flat structures
+          const progress = data?.Progress;
+          console.log("Account XP Progress:", JSON.stringify(progress));
+          const level =
+            typeof progress?.Level === "number"
+              ? progress.Level
+              : typeof data?.Level === "number"
+              ? data.Level
+              : typeof data?.accountLevel === "number"
+              ? data.accountLevel
+              : 0;
+          console.log("Account XP level extracted:", level, "from data keys:", Object.keys(data));
+          setAccountLevel(level);
         }
 
         // User info
@@ -285,7 +296,7 @@ function DashboardContent() {
         setLastChecked(new Date().toLocaleString("vi-VN"));
         setLoading(false);
       } catch (e) {
-        console.error(e);
+        console.error("fetchAll error:", e);
         setError("Lỗi kết nối. Token có thể đã hết hạn.");
         setLoading(false);
       }

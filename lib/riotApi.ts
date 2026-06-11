@@ -52,7 +52,18 @@ export async function fetchRank(accessToken: string, entitlementToken: string, v
 
   // 403/404 from MMR = account banned or region locked
   if (res.status === 403 || res.status === 404) {
-    return { __ban__: true, __status__: res.status };
+    const errBody = await res.text();
+    console.log("[fetchRank] 403/404 for puuid:", puuid, "status:", res.status, "body:", errBody);
+    // Ban thật sự (403 + có BAN/DENIED trong body) vs không có dữ liệu rank (404 RESOURCE_NOT_FOUND)
+    const errUpper = errBody.toUpperCase();
+    const isRealBan = res.status === 403 && (
+      errUpper.includes("BAN") || errUpper.includes("DENIED") || errUpper.includes("ACCESS_DENIED")
+    );
+    if (isRealBan) {
+      return { __ban__: true, __status__: res.status, __errorBody__: errBody };
+    }
+    // Không phải ban — có thể token hết hạn hoặc chưa có dữ liệu rank
+    return { __ban__: false, __status__: res.status };
   }
 
   if (!res.ok) {
@@ -60,6 +71,24 @@ export async function fetchRank(accessToken: string, entitlementToken: string, v
   }
 
   const data = await res.json();
+
+  // If main MMR endpoint returns data but no LatestCompetitiveUpdate, try competitive history
+  if (data.LatestCompetitiveUpdate) {
+    return data;
+  }
+
+  // Fallback: fetch competitive history to get latest match data
+  const histRes = await fetch(`https://${pdHost}/mmr/v1/players/${puuid}/competitivehistory`, {
+    headers: riotHeaders(accessToken, entitlementToken, version),
+  });
+
+  if (histRes.ok) {
+    const histData = await histRes.json();
+    // Re-attach the history to the main data object so the route.ts logic can use it
+    return { ...data, CompetitiveStats: histData, __hasCompetitiveHistory__: true };
+  }
+
+  // No competitive data available at all
   return data;
 }
 
