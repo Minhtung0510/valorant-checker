@@ -35,16 +35,18 @@ import re
 import secrets
 import shutil
 import sys
+import threading
 import time
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 
 # Setup logging
-os.makedirs("logs", exist_ok=True)
+LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger("valorant_checker")
 logger.setLevel(logging.INFO)
@@ -53,7 +55,7 @@ ch = logging.StreamHandler()
 ch.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S"))
 logger.addHandler(ch)
 
-fh = logging.FileHandler(f"logs/run_{datetime.now():%Y%m%d_%H%M%S}.log", encoding="utf-8")
+fh = logging.FileHandler(LOG_DIR / f"run_{datetime.now():%Y%m%d_%H%M%S}.log", encoding="utf-8")
 fh.setLevel(logging.DEBUG)
 fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger.addHandler(fh)
@@ -205,6 +207,13 @@ class Result:
         return asdict(self)
 
 
+@dataclass
+class CheckerRunSummary:
+    results: list[Result]
+    report_path: Optional[Path]
+    cancelled: bool = False
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # GOLOGIN CONNECTION
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -227,7 +236,13 @@ class GoLoginBrowser:
     3. Kết nối Playwright qua CDP
     """
     
-    def __init__(self, account: Account, proxy_info: Optional[ProxyInfo] = None):
+    def __init__(
+        self,
+        account: Account,
+        proxy_info: Optional[ProxyInfo] = None,
+        browser_path: Optional[Path] = None,
+        profiles_dir: Optional[Path] = None,
+    ):
         self.account = account
         self.browser = None
         self.context = None
@@ -239,6 +254,8 @@ class GoLoginBrowser:
         self._proxy: Optional[ProxyInfo] = proxy_info
         self._cdp_session = None
         self._profile_dir: Optional[Path] = None
+        self._browser_path = browser_path or GOLOGIN_BROWSER_PATH
+        self._profiles_dir = profiles_dir or PROFILES_DIR
     
     async def connect(self) -> bool:
         """
@@ -254,14 +271,14 @@ class GoLoginBrowser:
     
     async def _launch_and_connect(self) -> bool:
         """Launch Orbita browser rồi kết nối qua CDP."""
-        chrome_exe = GOLOGIN_BROWSER_PATH
+        chrome_exe = self._browser_path
         if not chrome_exe.exists():
             logger.error(f"  GoLogin browser not found: {chrome_exe}")
             return False
         
         # Tạo user-data-dir riêng cho mỗi account
         safe_name = re.sub(r'[^\w.-]', '_', self.account.username)
-        self._profile_dir = PROFILES_DIR / f"{safe_name}_{hash(self.account.username) & 0xFFFFFFFF}"
+        self._profile_dir = self._profiles_dir / f"{safe_name}_{hash(self.account.username) & 0xFFFFFFFF}"
         self._profile_dir.mkdir(parents=True, exist_ok=True)
         
         self._port = _alloc_debug_port()
@@ -1121,12 +1138,23 @@ async def get_account_data(
 # PROCESS ACCOUNT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def process_account(account: Account, sem: asyncio.Semaphore, proxy_info: Optional[ProxyInfo] = None) -> Result:
+async def process_account(
+    account: Account,
+    sem: asyncio.Semaphore,
+    proxy_info: Optional[ProxyInfo] = None,
+    browser_path: Optional[Path] = None,
+    profiles_dir: Optional[Path] = None,
+) -> Result:
     """Xử lý 1 account."""
     async with sem:
         t0 = time.time()
         
-        browser = GoLoginBrowser(account, proxy_info=proxy_info)
+        browser = GoLoginBrowser(
+            account,
+            proxy_info=proxy_info,
+            browser_path=browser_path,
+            profiles_dir=profiles_dir,
+        )
         
         try:
             # Kết nối GoLogin
@@ -1343,10 +1371,10 @@ footer a{{color:#ff4655;text-decoration:none}}
 </html>"""
 
 
-def save_results(results: list[Result]):
+def save_results(results: list[Result], output_dir: Optional[Path] = None) -> Path:
     """Lưu kết quả ra HTML + phân loại theo skin count."""
     ts = datetime.now().strftime("%d%m%Y_%H%M%S")
-    run_dir = OUTPUT_DIR / f"check_{ts}"
+    run_dir = (output_dir or OUTPUT_DIR) / f"check_{ts}"
     run_dir.mkdir(parents=True, exist_ok=True)
     
     # ── Phân loại tài khoản ──
@@ -1504,17 +1532,19 @@ def save_results(results: list[Result]):
     path = run_dir / "index.html"
     path.write_text(html, encoding="utf-8")
     logger.info(f"Saved: {path}")
+    return path
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_accounts() -> list[Account]:
+def load_accounts(accounts_file: Optional[Path] = None) -> list[Account]:
     """Load accounts từ file."""
-    if not ACCOUNTS_FILE.exists():
-        logger.error(f"File not found: {ACCOUNTS_FILE}")
-        ACCOUNTS_FILE.write_text("""# GoLogin Account Format
+    source = accounts_file or ACCOUNTS_FILE
+    if not source.exists():
+        logger.error(f"File not found: {source}")
+        source.write_text("""# Account format
 # username:password:region:proxy:profile_id:ws_url
 #
 # Ví dụ:
@@ -1529,7 +1559,7 @@ def load_accounts() -> list[Account]:
         return []
     
     accounts = []
-    for line in ACCOUNTS_FILE.read_text(encoding="utf-8").splitlines():
+    for line in source.read_text(encoding="utf-8").splitlines():
         acc = Account.parse(line)
         if acc:
             accounts.append(acc)
@@ -1537,64 +1567,129 @@ def load_accounts() -> list[Account]:
     return accounts
 
 
-def load_proxies() -> list[ProxyInfo]:
+def load_proxies(proxies_file: Optional[Path] = None) -> list[ProxyInfo]:
     """Load danh sách proxy từ proxies.txt.
     
     Format mỗi dòng: ip:port:user:pass hoặc ip:port
     Proxy được gán round-robin cho các account chưa có proxy.
     """
-    if not PROXIES_FILE.exists():
-        logger.warning(f"Proxies file not found: {PROXIES_FILE}")
+    source = proxies_file or PROXIES_FILE
+    if not source.exists():
+        logger.warning(f"Proxies file not found: {source}")
         return []
     proxies = []
-    for line in PROXIES_FILE.read_text(encoding="utf-8").splitlines():
+    for line in source.read_text(encoding="utf-8").splitlines():
         p = ProxyInfo.parse(line)
         if p:
             proxies.append(p)
     return proxies
 
 
-async def main():
+async def run_checker(
+    accounts_file: Path = ACCOUNTS_FILE,
+    proxies_file: Path = PROXIES_FILE,
+    output_dir: Path = OUTPUT_DIR,
+    concurrency: int = CONCURRENCY,
+    browser_path: Path = GOLOGIN_BROWSER_PATH,
+    progress_callback: Optional[Callable[[Result, int, int], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> CheckerRunSummary:
+    """Run checker with explicit paths so it can be embedded in the desktop app."""
+    concurrency = max(1, int(concurrency))
+    accounts_file = Path(accounts_file)
+    proxies_file = Path(proxies_file)
+    output_dir = Path(output_dir)
+    browser_path = Path(browser_path)
+    profiles_dir = output_dir / ".temporary_profiles"
+
     logger.info("=" * 55)
     logger.info("  VALORANT CHECKER - GoLogin Edition")
     logger.info("=" * 55)
-    logger.info(f"  Concurrency: {CONCURRENCY}")
-    logger.info(f"  Output: {OUTPUT_DIR}")
+    logger.info(f"  Concurrency: {concurrency}")
+    logger.info(f"  Output: {output_dir}")
     logger.info("=" * 55)
-    
+
     # Load accounts
-    accounts = load_accounts()
+    accounts = load_accounts(accounts_file)
     if not accounts:
         logger.error("No accounts found - check accounts.txt")
-        return
-    
+        return CheckerRunSummary(results=[], report_path=None)
+
     logger.info(f"Loaded {len(accounts)} accounts")
-    
+
     # Load proxies từ proxies.txt
-    proxies = load_proxies()
+    proxies = load_proxies(proxies_file)
     if proxies:
-        logger.info(f"Loaded {len(proxies)} proxies from proxies.txt")
+        logger.info(f"Loaded {len(proxies)} proxies from {proxies_file}")
     else:
         logger.warning("No proxies loaded - all accounts will use direct connection")
-    
+
     # Load Valorant skins map once for deduplication
     logger.info("Loading Valorant skins mapping from API...")
     await load_valorant_skins_map()
-    
+
     # Gán proxy round-robin cho các account chưa có proxy
-    sem = asyncio.Semaphore(CONCURRENCY)
-    tasks = []
+    sem = asyncio.Semaphore(concurrency)
+    tasks: list[asyncio.Task[tuple[int, Result]]] = []
+
+    async def run_one(index: int, account: Account, proxy_info: Optional[ProxyInfo]):
+        result = await process_account(
+            account,
+            sem,
+            proxy_info=proxy_info,
+            browser_path=browser_path,
+            profiles_dir=profiles_dir,
+        )
+        return index, result
+
     for i, acc in enumerate(accounts):
         pi = None
         if proxies and not acc.proxy:
             pi = proxies[i % len(proxies)]
             acc.proxy = pi.http_url  # Set cho httpx API calls
-        tasks.append(process_account(acc, sem, proxy_info=pi))
-    results = await asyncio.gather(*tasks)
-    
+        tasks.append(asyncio.create_task(run_one(i, acc, pi)))
+
+    pending = set(tasks)
+    ordered_results: list[Optional[Result]] = [None] * len(accounts)
+    completed_count = 0
+    cancelled = False
+
+    while pending:
+        if cancel_event and cancel_event.is_set():
+            cancelled = True
+            logger.warning("Stop requested - closing active browsers...")
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            break
+
+        done, pending = await asyncio.wait(
+            pending,
+            timeout=0.25,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            try:
+                index, result = task.result()
+            except asyncio.CancelledError:
+                continue
+            except Exception as exc:
+                logger.error(f"Unhandled account task error: {exc}")
+                continue
+
+            ordered_results[index] = result
+            completed_count += 1
+            if progress_callback:
+                try:
+                    progress_callback(result, completed_count, len(accounts))
+                except Exception as exc:
+                    logger.warning(f"Progress callback failed: {exc}")
+
+    results = [result for result in ordered_results if result is not None]
+
     # Save
-    save_results(list(results))
-    
+    report_path = save_results(results, output_dir) if results else None
+
     # Summary
     active = sum(1 for r in results if r.ok and r.status == "active")
     banned = sum(1 for r in results if r.status in ("banned", "time_ban"))
@@ -1607,9 +1702,14 @@ async def main():
     logger.info(f"  Active: {active}")
     logger.info(f"  Banned: {banned}")
     logger.info(f"  Errors: {errors}")
-    logger.info(f"  Output: {OUTPUT_DIR}")
+    logger.info(f"  Output: {output_dir}")
     logger.info("=" * 55)
-    logger.info("  DONE!")
+    logger.info("  CANCELLED" if cancelled else "  DONE!")
+    return CheckerRunSummary(results=results, report_path=report_path, cancelled=cancelled)
+
+
+async def main():
+    await run_checker()
 
 
 if __name__ == "__main__":

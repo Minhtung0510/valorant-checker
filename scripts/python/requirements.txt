@@ -4,8 +4,12 @@
 playwright>=1.40.0
 httpx>=0.25.0
 requests>=2.31.0
+cryptography>=42.0.0
 python-dotenv>=1.0.0
 loguru>=0.7.0
+
+# Build desktop executables
+pyinstaller>=6.0.0
 
 # Optional: GoLogin SDK (nếu dùng API token)
 # pip install pygologin

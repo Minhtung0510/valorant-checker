@@ -1,0 +1,13 @@
+fix: resolve all multi-account bugs (Bug 1-6 from user review)
+
+Bug 1: Shared Chromium browser — each account gets its own
+  BrowserContext instead of spawning a new Chromium process.
+Bug 2: Stagger request starts — delay moved before task execution
+  instead of after completion, preventing burst rate-limit hits.
+Bug 3: Proxy for ALL httpx calls — each account creates its own
+  httpx.AsyncClient with its proxy, not just during auth.
+Bug 4: accounts.json write lock — _db_lock prevents concurrent
+  writes from corrupting token data.
+Bug 5: lockfile_tokens() called once, not twice.
+Bug 6: _VERSION_LOCK is now module-level, not recreated per call.
+Bug 11: Removed dead refresh_token block (Riot RSO doesn't support it).

@@ -69,3 +69,7 @@ accounts.txt
 
 # Google Sheets creds
 credentials.json
+
+# Desktop license admin secrets
+scripts/python/license_private_key.pem
+scripts/python/key_records.json
