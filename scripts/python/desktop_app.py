@@ -82,6 +82,7 @@ class ValorantCheckerApp:
         self.progress_fill: int | None = None
         self.result_canvas: tk.Canvas | None = None
         self.result_rows_frame: tk.Frame | None = None
+        self.result_header_vars: list[tk.StringVar] = []
         self.total_stat_var = tk.StringVar(value="0")
         self.active_stat_var = tk.StringVar(value="0")
         self.banned_stat_var = tk.StringVar(value="0")
@@ -501,11 +502,14 @@ class ValorantCheckerApp:
 
         header = tk.Frame(table, bg="#162432")
         header.pack(fill="x")
+        self.result_header_vars = []
         for index, (title, weight) in enumerate(columns):
             header.columnconfigure(index, weight=weight, uniform="result_table")
+            title_var = tk.StringVar(value=title)
+            self.result_header_vars.append(title_var)
             tk.Label(
                 header,
-                text=title,
+                textvariable=title_var,
                 bg="#162432",
                 fg=MUTED,
                 padx=12,
@@ -535,6 +539,10 @@ class ValorantCheckerApp:
         self.result_canvas.bind("<Enter>", lambda _event: self.result_canvas.bind_all("<MouseWheel>", self._on_result_mousewheel))
         self.result_canvas.bind("<Leave>", lambda _event: self.result_canvas.unbind_all("<MouseWheel>"))
 
+    def _set_result_headers(self, titles: tuple[str, str, str, str, str, str]) -> None:
+        for variable, title in zip(self.result_header_vars, titles):
+            variable.set(title)
+
     def _on_result_mousewheel(self, event) -> None:
         if self.result_canvas:
             self.result_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -554,7 +562,7 @@ class ValorantCheckerApp:
         self.banned_stat_var.set(str(self.result_counts["banned"]))
         self.error_stat_var.set(str(self.result_counts["error"]))
 
-    def _append_result_row(self, result: checker.Result, tag: str, rank: str, message: str) -> None:
+    def _append_table_row(self, values: list[str], tag: str) -> None:
         if not self.result_rows_frame:
             return
         row_index = self.result_row_count
@@ -571,14 +579,6 @@ class ValorantCheckerApp:
         for index, weight in enumerate((2, 2, 1, 1, 1, 3)):
             row.columnconfigure(index, weight=weight, uniform="result_table")
 
-        values = [
-            result.username,
-            result.status_label,
-            str(result.skins_count),
-            rank,
-            result.region.upper(),
-            message,
-        ]
         for index, value in enumerate(values):
             if index == 1:
                 pill = tk.Label(
@@ -607,6 +607,19 @@ class ValorantCheckerApp:
         if self.result_canvas:
             self.result_canvas.update_idletasks()
             self.result_canvas.configure(scrollregion=self.result_canvas.bbox("all"))
+
+    def _append_result_row(self, result: checker.Result, tag: str, rank: str, message: str) -> None:
+        self._append_table_row(
+            [
+                result.username,
+                result.status_label,
+                str(result.skins_count),
+                rank,
+                result.region.upper(),
+                message,
+            ],
+            tag,
+        )
 
     def _set_progress(self, value: float) -> None:
         self.progress_var.set(max(0, min(100, value)))
@@ -716,9 +729,11 @@ class ValorantCheckerApp:
         self.progress_text_var.set("0 / 0")
         self.run_status_var.set("Đang khởi tạo...")
         self.start_button.configure(state="disabled")
+        self.proxy_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.report_button.configure(state="disabled")
         self._clear_result_rows()
+        self._set_result_headers(("Account", "Status", "Skins", "Rank", "Region", "Info"))
 
         accounts_file = Path(self.accounts_var.get())
         account_total = len(checker.load_accounts(accounts_file))
@@ -869,6 +884,7 @@ th{{background:#162432;color:#8b978f;font-size:12px;text-transform:uppercase}}
         self.stop_button.configure(state="normal")
         self.report_button.configure(state="disabled")
         self._clear_result_rows()
+        self._set_result_headers(("Proxy", "Status", "Latency", "Exit IP", "Server", "Error"))
 
         proxies_file = Path(self.proxies_var.get())
         proxies = checker.load_proxies(proxies_file)
@@ -924,8 +940,16 @@ th{{background:#162432;color:#8b978f;font-size:12px;text-transform:uppercase}}
                     self._set_progress((done / total) * 100 if total else 0)
                     self.progress_text_var.set(f"{done} / {total}")
                     self.run_status_var.set(f"Đã xử lý {done}/{total}")
+                elif kind == "proxy_result":
+                    _kind, result, done, total = event
+                    self._add_proxy_result(result)
+                    self._set_progress((done / total) * 100 if total else 0)
+                    self.progress_text_var.set(f"{done} / {total}")
+                    self.run_status_var.set(f"Checked {done}/{total} proxies")
                 elif kind == "finished":
                     self._finish_run(event[1])
+                elif kind == "proxy_finished":
+                    self._finish_proxy_check(event[1], event[2], event[3])
                 elif kind == "fatal":
                     self._finish_with_error(event[1])
         except queue.Empty:
@@ -945,9 +969,26 @@ th{{background:#162432;color:#8b978f;font-size:12px;text-transform:uppercase}}
         self._sync_stats()
         self._append_result_row(result, tag, rank, message)
 
+    def _add_proxy_result(self, result: dict) -> None:
+        tag = "active" if result["ok"] else "banned"
+        self.result_counts[tag] += 1
+        self._sync_stats()
+        self._append_table_row(
+            [
+                result["proxy"],
+                "LIVE" if result["ok"] else "DEAD",
+                f"{result['latency_ms']} ms",
+                result["ip"] or "-",
+                result["server"],
+                result["error"] or "OK",
+            ],
+            tag,
+        )
+
     def _finish_run(self, summary: checker.CheckerRunSummary) -> None:
         self.report_path = summary.report_path
         self.start_button.configure(state="normal")
+        self.proxy_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         if self.report_path:
             self.report_button.configure(state="normal")
@@ -957,8 +998,25 @@ th{{background:#162432;color:#8b978f;font-size:12px;text-transform:uppercase}}
             self.run_status_var.set(f"Hoàn tất {len(summary.results)} account")
             self._set_progress(100)
 
+    def _finish_proxy_check(self, report_path: Path | None, results: list[dict], cancelled: bool) -> None:
+        self.report_path = report_path
+        self.start_button.configure(state="normal")
+        self.proxy_button.configure(state="normal")
+        self.stop_button.configure(state="disabled")
+        if self.report_path:
+            self.report_button.configure(state="normal")
+
+        live_count = sum(1 for result in results if result["ok"])
+        dead_count = len(results) - live_count
+        if cancelled:
+            self.run_status_var.set(f"Stopped. Saved {len(results)} proxy results.")
+        else:
+            self.run_status_var.set(f"Completed: {live_count} live / {dead_count} dead")
+            self._set_progress(100)
+
     def _finish_with_error(self, message: str) -> None:
         self.start_button.configure(state="normal")
+        self.proxy_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         self.run_status_var.set("Có lỗi nghiêm trọng")
         messagebox.showerror("Checker error", message)
