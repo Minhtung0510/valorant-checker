@@ -16,7 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import requests
 
-from app_runtime import app_data_dir
+from app_runtime import app_data_dir, executable_dir
 from license_core import get_machine_id
 from license_store import activate_license, clear_license, load_valid_license
 
@@ -193,6 +193,7 @@ class ValorantCheckerApp:
     @staticmethod
     def _default_browser_path() -> str:
         candidates = [
+            executable_dir() / "browser" / "orbita-browser-145" / "chrome.exe",
             Path.home() / "Downloads" / "Gologin" / "All-Browsers" / "orbita-browser-145" / "chrome.exe",
             Path(os.getenv("LOCALAPPDATA", "")) / "Programs" / "GoLogin" / "orbita-browser" / "chrome.exe",
         ]

@@ -26,6 +26,9 @@ scripts/python/dist-fixed/
 scripts/python/build-omo/
 scripts/python/dist-omo/
 scripts/python/proxies_test.txt
+scripts/python/installer/build-package/
+scripts/python/installer/dist-package/
+scripts/python/installer/output/
 
 # Python cache
 __pycache__/
