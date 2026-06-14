@@ -71,6 +71,7 @@ class ValorantCheckerApp:
         self.accounts_var = tk.StringVar()
         self.proxies_var = tk.StringVar()
         self.browser_var = tk.StringVar(value=self._default_browser_path())
+        self.extension_var = tk.StringVar()
         self.output_var = tk.StringVar(value=str(Path.home() / "Desktop" / "Check-done"))
         self.concurrency_var = tk.IntVar(value=2)
         self.accounts_count_var = tk.StringVar(value="Chưa import")
@@ -208,6 +209,7 @@ class ValorantCheckerApp:
         self.accounts_var.set(settings.get("accounts_file", ""))
         self.proxies_var.set(settings.get("proxies_file", ""))
         self.browser_var.set(settings.get("browser_path", self.browser_var.get()))
+        self.extension_var.set(settings.get("extension_path", ""))
         self.output_var.set(settings.get("output_dir", self.output_var.get()))
         self.concurrency_var.set(int(settings.get("concurrency", 2)))
 
@@ -216,6 +218,7 @@ class ValorantCheckerApp:
             "accounts_file": self.accounts_var.get(),
             "proxies_file": self.proxies_var.get(),
             "browser_path": self.browser_var.get(),
+            "extension_path": self.extension_var.get(),
             "output_dir": self.output_var.get(),
             "concurrency": int(self.concurrency_var.get()),
         }
@@ -357,6 +360,7 @@ class ValorantCheckerApp:
         self._path_row(config_inner, 1, 0, "Proxies TXT", self.proxies_var, self.choose_proxies, self.proxies_count_var)
         self._path_row(config_inner, 0, 3, "Orbita chrome.exe", self.browser_var, self.choose_browser)
         self._path_row(config_inner, 1, 3, "Thư mục output", self.output_var, self.choose_output)
+        self._path_row(config_inner, 2, 3, "OMO extension", self.extension_var, self.choose_extension)
 
         self._tk_label(config_inner, "Concurrency", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 9)).grid(
             row=2, column=0, sticky="w", pady=(12, 0), padx=(0, 10)
@@ -377,7 +381,7 @@ class ValorantCheckerApp:
         self._button(conc_row, "+", lambda: self._change_concurrency(1), "secondary", width=3).pack(side="left")
 
         controls = tk.Frame(config_inner, bg=CARD)
-        controls.grid(row=2, column=3, columnspan=3, sticky="e", pady=(12, 0))
+        controls.grid(row=3, column=3, columnspan=3, sticky="e", pady=(12, 0))
         self.start_button = self._button(controls, "Bắt đầu", self.start_run, "success", width=12)
         self.start_button.pack(side="left")
         self.proxy_button = self._button(controls, "Check Proxy", self.start_proxy_check, "primary", width=12)
@@ -658,6 +662,11 @@ class ValorantCheckerApp:
         if path:
             self.browser_var.set(path)
 
+    def choose_extension(self) -> None:
+        path = filedialog.askdirectory(title="Chọn thư mục extension có manifest.json")
+        if path:
+            self.extension_var.set(path)
+
     def choose_output(self) -> None:
         path = filedialog.askdirectory(title="Chọn thư mục output")
         if path:
@@ -689,6 +698,14 @@ class ValorantCheckerApp:
         if not browser_path.is_file():
             messagebox.showwarning("Thiếu Orbita", "Không tìm thấy file Orbita chrome.exe.")
             return False
+        if self.extension_var.get():
+            extension_path = Path(self.extension_var.get())
+            if not extension_path.is_dir() or not (extension_path / "manifest.json").is_file():
+                messagebox.showwarning(
+                    "Sai extension",
+                    "Hãy chọn thư mục extension đã giải nén và có file manifest.json.",
+                )
+                return False
         if self.proxies_var.get() and not Path(self.proxies_var.get()).is_file():
             messagebox.showwarning("Sai file proxy", "File proxy đã chọn không tồn tại.")
             return False
@@ -744,6 +761,7 @@ class ValorantCheckerApp:
             proxies_file.write_text("", encoding="utf-8")
         output_dir = Path(self.output_var.get())
         browser_path = Path(self.browser_var.get())
+        extension_path = Path(self.extension_var.get()) if self.extension_var.get() else None
         concurrency = int(self.concurrency_var.get())
 
         def progress(result: checker.Result, done: int, total: int) -> None:
@@ -758,6 +776,7 @@ class ValorantCheckerApp:
                         output_dir=output_dir,
                         concurrency=concurrency,
                         browser_path=browser_path,
+                        extension_path=extension_path,
                         progress_callback=progress,
                         cancel_event=self.cancel_event,
                     )
@@ -780,42 +799,63 @@ class ValorantCheckerApp:
         proxy_line = ValorantCheckerApp._proxy_to_line(proxy)
         started = time.perf_counter()
         proxies = {"http": proxy.http_url, "https": proxy.http_url}
-        try:
-            response = requests.get(
-                "https://api.ipify.org?format=json",
-                proxies=proxies,
-                timeout=timeout,
-                headers={"User-Agent": "ValorantChecker/1.0"},
-            )
-            latency_ms = int((time.perf_counter() - started) * 1000)
-            if response.ok:
-                ip = response.json().get("ip", "")
-                return {
-                    "ok": True,
-                    "proxy": proxy_line,
-                    "server": proxy.server,
-                    "latency_ms": latency_ms,
-                    "ip": ip,
-                    "error": "",
-                }
-            return {
-                "ok": False,
-                "proxy": proxy_line,
-                "server": proxy.server,
-                "latency_ms": latency_ms,
-                "ip": "",
-                "error": f"HTTP {response.status_code}",
-            }
-        except Exception as exc:
-            latency_ms = int((time.perf_counter() - started) * 1000)
-            return {
-                "ok": False,
-                "proxy": proxy_line,
-                "server": proxy.server,
-                "latency_ms": latency_ms,
-                "ip": "",
-                "error": str(exc).splitlines()[0][:160],
-            }
+        headers = {"User-Agent": "Mozilla/5.0 ValorantChecker/1.0"}
+        session = requests.Session()
+        session.trust_env = False
+
+        failures: list[str] = []
+        connectivity_targets = (
+            ("Riot HTTPS", "https://auth.riotgames.com/authorize"),
+            ("Google HTTPS", "https://www.google.com/generate_204"),
+        )
+        per_request_timeout = max(3.0, min(6.0, timeout / 2))
+
+        for label, url in connectivity_targets:
+            try:
+                response = session.get(
+                    url,
+                    proxies=proxies,
+                    timeout=per_request_timeout,
+                    headers=headers,
+                    allow_redirects=False,
+                )
+                if response.status_code != 407 and response.status_code < 500:
+                    ip = ""
+                    try:
+                        ip_response = session.get(
+                            "https://icanhazip.com/",
+                            proxies=proxies,
+                            timeout=3.0,
+                            headers=headers,
+                        )
+                        if ip_response.ok:
+                            ip = ip_response.text.strip()[:64]
+                    except requests.RequestException:
+                        pass
+
+                    return {
+                        "ok": True,
+                        "proxy": proxy_line,
+                        "server": proxy.server,
+                        "latency_ms": int((time.perf_counter() - started) * 1000),
+                        "ip": ip,
+                        "check": f"{label} ({response.status_code})",
+                        "error": "",
+                    }
+                failures.append(f"{label}: HTTP {response.status_code}")
+            except requests.RequestException as exc:
+                reason = exc.__class__.__name__
+                failures.append(f"{label}: {reason}")
+
+        return {
+            "ok": False,
+            "proxy": proxy_line,
+            "server": proxy.server,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "ip": "",
+            "check": "",
+            "error": "; ".join(failures)[:160] or "No response",
+        }
 
     @staticmethod
     def _write_proxy_report(output_dir: Path, results: list[dict]) -> Path:
@@ -831,7 +871,7 @@ class ValorantCheckerApp:
         rows = "\n".join(
             f"<tr><td>{html.escape(r['proxy'])}</td><td class=\"{'ok' if r['ok'] else 'bad'}\">"
             f"{'LIVE' if r['ok'] else 'DEAD'}</td><td>{r['latency_ms']}ms</td>"
-            f"<td>{html.escape(r['ip'])}</td><td>{html.escape(r['error'])}</td></tr>"
+            f"<td>{html.escape(r['ip'])}</td><td>{html.escape(r.get('check') or r['error'])}</td></tr>"
             for r in results
         )
         report = f"""<!doctype html>
@@ -858,7 +898,7 @@ th{{background:#162432;color:#8b978f;font-size:12px;text-transform:uppercase}}
   <div class="stat"><div class="n" style="color:#ef5350">{len(dead)}</div><div class="l">Dead</div></div>
 </div>
 <table>
-<thead><tr><th>Proxy</th><th>Status</th><th>Latency</th><th>Exit IP</th><th>Error</th></tr></thead>
+<thead><tr><th>Proxy</th><th>Status</th><th>Latency</th><th>Exit IP</th><th>Details</th></tr></thead>
 <tbody>{rows}</tbody>
 </table>
 </body>
@@ -980,7 +1020,7 @@ th{{background:#162432;color:#8b978f;font-size:12px;text-transform:uppercase}}
                 f"{result['latency_ms']} ms",
                 result["ip"] or "-",
                 result["server"],
-                result["error"] or "OK",
+                result.get("check") or result["error"] or "OK",
             ],
             tag,
         )

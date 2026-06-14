@@ -21,6 +21,11 @@ scripts/python/__pycache__/
 scripts/python/*.pyc
 scripts/python/venv/
 scripts/python/.venv/
+scripts/python/build-fixed/
+scripts/python/dist-fixed/
+scripts/python/build-omo/
+scripts/python/dist-omo/
+scripts/python/proxies_test.txt
 
 # Python cache
 __pycache__/

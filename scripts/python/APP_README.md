@@ -31,10 +31,10 @@ Key được ký Ed25519. Client không chứa private key nên không thể t�
 
 1. Import file proxy dang `ip:port:user:password` hoac `ip:port`.
 2. Chon thu muc output va concurrency.
-3. Nhan **Check Proxy** de kiem tra realtime qua `api.ipify.org`.
+3. Nhan **Check Proxy** de kiem tra HTTPS truc tiep toi Riot, sau do thu lay exit IP neu dich vu IP cho phep.
 4. Ket qua duoc chia thanh `live_proxies.txt`, `dead_proxies.txt` va `index.html` trong thu muc `proxy_check_<timestamp>`.
 
-Timeout cua moi proxy la 12 giay. Nut **Dung** se ngung nhan them proxy moi va luu cac ket qua da hoan thanh.
+Mot proxy van duoc danh dau **LIVE** neu ket noi Riot hoat dong, ke ca khi dich vu do exit IP bi proxy chan. Timeout cua moi proxy la 12 giay. Nut **Dung** se ngung nhan them proxy moi va luu cac ket qua da hoan thanh.
 
 ## Build
 

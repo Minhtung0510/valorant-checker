@@ -242,6 +242,7 @@ class GoLoginBrowser:
         proxy_info: Optional[ProxyInfo] = None,
         browser_path: Optional[Path] = None,
         profiles_dir: Optional[Path] = None,
+        extension_path: Optional[Path] = None,
     ):
         self.account = account
         self.browser = None
@@ -256,6 +257,17 @@ class GoLoginBrowser:
         self._profile_dir: Optional[Path] = None
         self._browser_path = browser_path or GOLOGIN_BROWSER_PATH
         self._profiles_dir = profiles_dir or PROFILES_DIR
+        self._extension_path = Path(extension_path).resolve() if extension_path else None
+
+    def _extension_args(self) -> list[str]:
+        if not self._extension_path:
+            return []
+
+        extension_dir = str(self._extension_path)
+        return [
+            f"--disable-extensions-except={extension_dir}",
+            f"--load-extension={extension_dir}",
+        ]
     
     async def connect(self) -> bool:
         """
@@ -264,10 +276,65 @@ class GoLoginBrowser:
         """
         # Nếu có ws_url sẵn thì connect trực tiếp (không cần launch)
         if self.account.ws_url:
+            if self._extension_path:
+                logger.warning("  Extension path is ignored when connecting to an existing ws_url browser")
             return await self._connect_ws(self.account.ws_url)
+
+        # Configure authenticated proxies before Chromium creates its first
+        # HTTPS tunnel. Supplying credentials later through CDP is unreliable.
+        if self._proxy and self._proxy.username:
+            return await self._launch_persistent_with_proxy()
         
         # Tự launch Orbita browser
         return await self._launch_and_connect()
+
+    async def _launch_persistent_with_proxy(self) -> bool:
+        chrome_exe = self._browser_path
+        if not chrome_exe.exists():
+            logger.error(f"  GoLogin browser not found: {chrome_exe}")
+            return False
+
+        safe_name = re.sub(r'[^\w.-]', '_', self.account.username)
+        self._profile_dir = self._profiles_dir / f"{safe_name}_{hash(self.account.username) & 0xFFFFFFFF}"
+        self._profile_dir.mkdir(parents=True, exist_ok=True)
+
+        proxy = self._proxy
+        logger.info(f"  Launching Orbita for {self.account.username} via authenticated proxy {proxy.server}")
+        try:
+            from playwright.async_api import async_playwright
+
+            self._pw_context_manager = async_playwright()
+            self._playwright = await self._pw_context_manager.__aenter__()
+            self.context = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir=str(self._profile_dir),
+                executable_path=str(chrome_exe),
+                headless=False,
+                proxy={
+                    "server": f"http://{proxy.server}",
+                    "username": proxy.username,
+                    "password": proxy.password,
+                },
+                args=[
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-background-networking",
+                    "--disable-sync",
+                    "--disable-translate",
+                    "--metrics-recording-only",
+                    "--no-service-autorun",
+                    "--password-store=basic",
+                    *self._extension_args(),
+                ],
+            )
+            if self.context.pages:
+                self.page = self.context.pages[0]
+            else:
+                self.page = await self.context.new_page()
+            logger.info(f"  Browser ready via authenticated proxy {proxy.server}")
+            return True
+        except Exception as exc:
+            logger.error(f"  Authenticated proxy browser launch failed: {exc}")
+            return False
     
     async def _launch_and_connect(self) -> bool:
         """Launch Orbita browser rồi kết nối qua CDP."""
@@ -296,6 +363,7 @@ class GoLoginBrowser:
             "--metrics-recording-only",
             "--no-service-autorun",
             "--password-store=basic",
+            *self._extension_args(),
             "about:blank",
         ]
         
@@ -391,17 +459,37 @@ class GoLoginBrowser:
             
             proxy = self._proxy
             cdp = self._cdp_session
+
+            def schedule_cdp(method: str, payload: dict) -> None:
+                task = asyncio.create_task(cdp.send(method, payload))
+
+                def log_failure(done_task: asyncio.Task) -> None:
+                    try:
+                        done_task.result()
+                    except Exception as exc:
+                        logger.debug(f"  Proxy CDP handler {method} failed: {exc}")
+
+                task.add_done_callback(log_failure)
+
+            def on_request_paused(params):
+                schedule_cdp("Fetch.continueRequest", {"requestId": params["requestId"]})
             
             def on_auth_required(params):
-                asyncio.ensure_future(cdp.send("Fetch.continueWithAuth", {
-                    "requestId": params["requestId"],
-                    "authChallengeResponse": {
+                challenge = params.get("authChallenge", {})
+                if challenge.get("source") == "Proxy":
+                    response = {
                         "response": "ProvideCredentials",
                         "username": proxy.username,
                         "password": proxy.password,
                     }
-                }))
+                else:
+                    response = {"response": "Default"}
+                schedule_cdp(
+                    "Fetch.continueWithAuth",
+                    {"requestId": params["requestId"], "authChallengeResponse": response},
+                )
             
+            self._cdp_session.on("Fetch.requestPaused", on_request_paused)
             self._cdp_session.on("Fetch.authRequired", on_auth_required)
             logger.info(f"  Proxy auth handler ready for {self._proxy.server}")
         except Exception as e:
@@ -448,6 +536,11 @@ class GoLoginBrowser:
         try:
             if self.browser:
                 await self.browser.close()
+        except:
+            pass
+        try:
+            if self.context and not self.browser:
+                await self.context.close()
         except:
             pass
         try:
@@ -925,23 +1018,30 @@ class GoLoginBrowser:
 # Bản đồ ánh xạ level_uuid -> base_skin_name
 VALORANT_SKINS_MAP: dict[str, str] = {}
 
-async def load_valorant_skins_map():
+async def load_valorant_skins_map(api_request=None):
     """Tải danh sách skin từ valorant-api.com và ánh xạ các level về skin gốc."""
     global VALORANT_SKINS_MAP
     if VALORANT_SKINS_MAP:
         return
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get("https://valorant-api.com/v1/weapons/skins")
-            if resp.is_success:
-                data = resp.json().get("data", [])
-                for skin in data:
-                    base_name = skin.get("displayName", "")
-                    for level in skin.get("levels", []):
-                        lvl_uuid = level.get("uuid")
-                        if lvl_uuid:
-                            VALORANT_SKINS_MAP[lvl_uuid.lower()] = base_name
-                logger.info(f"Loaded {len(VALORANT_SKINS_MAP)} skin levels into map")
+        if api_request:
+            resp = await api_request.get("https://valorant-api.com/v1/weapons/skins", timeout=30_000)
+            payload = await resp.json() if resp.ok else {}
+        else:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get("https://valorant-api.com/v1/weapons/skins")
+                payload = resp.json() if resp.is_success else {}
+
+        for skin in payload.get("data", []):
+            base_name = skin.get("displayName", "")
+            for level in skin.get("levels", []):
+                lvl_uuid = level.get("uuid")
+                if lvl_uuid:
+                    VALORANT_SKINS_MAP[lvl_uuid.lower()] = base_name
+        if VALORANT_SKINS_MAP:
+            logger.info(f"Loaded {len(VALORANT_SKINS_MAP)} skin levels into map")
+        else:
+            logger.warning("Valorant skins map response was empty")
     except Exception as e:
         logger.error(f"Failed to load valorant skins map from API: {e}")
 
@@ -957,18 +1057,25 @@ async def get_account_data(
     puuid: str,
     region: str,
     proxy: str = "",
+    api_request=None,
 ) -> dict:
     """Lấy tất cả data của account."""
     version = "release-12.10-shipping-17-4738152"
     
-    # Get version
+    # Get version. Prefer Playwright's request context because it shares the
+    # browser networking stack and Windows certificate trust configuration.
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get("https://valorant-api.com/v1/version")
-            if resp.is_success:
-                version = resp.json()["data"]["riotClientVersion"]
-    except:
-        pass
+        if api_request:
+            resp = await api_request.get("https://valorant-api.com/v1/version", timeout=10_000)
+            if resp.ok:
+                version = (await resp.json())["data"]["riotClientVersion"]
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get("https://valorant-api.com/v1/version")
+                if resp.is_success:
+                    version = resp.json()["data"]["riotClientVersion"]
+    except Exception as exc:
+        logger.warning(f"  Cannot refresh Riot client version: {exc}")
     
     proxies = {}
     if proxy:
@@ -982,38 +1089,65 @@ async def get_account_data(
     }
     
     async with httpx.AsyncClient(timeout=15.0, proxies=proxies) as client:
-        async def get(url):
+        async def get(url: str, label: str):
             try:
-                r = await client.get(url, headers=headers)
-                return r.json() if r.is_success else {}
-            except:
-                return {}
-        
-        async def get_mmr(url):
-            """MMR endpoint - captures ban status from 403/404."""
-            try:
+                if api_request:
+                    r = await api_request.get(url, headers=headers, timeout=15_000)
+                    if r.ok:
+                        return await r.json()
+                    logger.warning(f"  Riot API {label} returned HTTP {r.status}")
+                    return {}
+
                 r = await client.get(url, headers=headers)
                 if r.is_success:
                     return r.json()
-                if r.status_code in (403, 404):
+                logger.warning(f"  Riot API {label} returned HTTP {r.status_code}")
+                return {}
+            except Exception as exc:
+                logger.warning(f"  Riot API {label} failed: {exc}")
+                return {}
+        
+        async def get_mmr(url: str):
+            """MMR endpoint - captures ban status from 403/404."""
+            try:
+                if api_request:
+                    r = await api_request.get(url, headers=headers, timeout=15_000)
+                    status = r.status
+                    if r.ok:
+                        return await r.json()
+                    body_text = await r.text()
+                else:
+                    r = await client.get(url, headers=headers)
+                    status = r.status_code
+                    if r.is_success:
+                        return r.json()
                     body_text = r.text
+
+                if status in (403, 404):
                     body_upper = body_text.upper()
-                    is_ban = r.status_code == 403 and (
+                    is_ban = status == 403 and (
                         "BAN" in body_upper or "DENIED" in body_upper or "ACCESS_DENIED" in body_upper
                     )
-                    return {"__ban__": is_ban, "__status__": r.status_code, "__body__": body_text}
+                    return {"__ban__": is_ban, "__status__": status, "__body__": body_text}
+                logger.warning(f"  Riot API mmr returned HTTP {status}")
                 return {}
-            except:
+            except Exception as exc:
+                logger.warning(f"  Riot API mmr failed: {exc}")
                 return {}
         
         # Gọi song song các API cơ bản
         userinfo, wallet, mmr, skins, xp = await asyncio.gather(
-            get("https://auth.riotgames.com/userinfo"),
-            get(f"https://pd.{region}.a.pvp.net/store/v1/wallet/{puuid}"),
+            get("https://auth.riotgames.com/userinfo", "userinfo"),
+            get(f"https://pd.{region}.a.pvp.net/store/v1/wallet/{puuid}", "wallet"),
             get_mmr(f"https://pd.{region}.a.pvp.net/mmr/v1/players/{puuid}"),
-            get(f"https://pd.{region}.a.pvp.net/store/v1/entitlements/{puuid}/{UUID_SKINS}"),
-            get(f"https://pd.{region}.a.pvp.net/account-xp/v1/players/{puuid}"),
+            get(f"https://pd.{region}.a.pvp.net/store/v1/entitlements/{puuid}/{UUID_SKINS}", "skins"),
+            get(f"https://pd.{region}.a.pvp.net/account-xp/v1/players/{puuid}", "account-xp"),
         )
+
+        if not userinfo:
+            raise RuntimeError("Riot userinfo API returned no data")
+        if "Entitlements" not in skins:
+            raise RuntimeError("Riot inventory API returned no data")
         
         # Parse balances
         bals = wallet.get("Balances", {})
@@ -1028,7 +1162,10 @@ async def get_account_data(
         
         if not comp or not comp.get("MatchID"):
             # Thử lấy lịch sử đấu xếp hạng nếu LatestCompetitiveUpdate trống
-            hist = await get(f"https://pd.{region}.a.pvp.net/mmr/v1/players/{puuid}/competitivehistory")
+            hist = await get(
+                f"https://pd.{region}.a.pvp.net/mmr/v1/players/{puuid}/competitivehistory",
+                "competitive-history",
+            )
             matches = hist.get("Matches", [])
             if matches and isinstance(matches, list) and len(matches) > 0:
                 comp = matches[0]
@@ -1144,6 +1281,7 @@ async def process_account(
     proxy_info: Optional[ProxyInfo] = None,
     browser_path: Optional[Path] = None,
     profiles_dir: Optional[Path] = None,
+    extension_path: Optional[Path] = None,
 ) -> Result:
     """Xử lý 1 account."""
     async with sem:
@@ -1154,6 +1292,7 @@ async def process_account(
             proxy_info=proxy_info,
             browser_path=browser_path,
             profiles_dir=profiles_dir,
+            extension_path=extension_path,
         )
         
         try:
@@ -1188,12 +1327,16 @@ async def process_account(
                 )
             
             # Lấy account data
+            if not VALORANT_SKINS_MAP and browser.context:
+                await load_valorant_skins_map(browser.context.request)
+
             data = await get_account_data(
                 tokens["access_token"],
                 tokens["entitlements_token"],
                 tokens["puuid"],
                 account.region,
                 account.proxy,
+                api_request=browser.context.request if browser.context else None,
             )
             
             elapsed = time.time() - t0
@@ -1591,6 +1734,7 @@ async def run_checker(
     output_dir: Path = OUTPUT_DIR,
     concurrency: int = CONCURRENCY,
     browser_path: Path = GOLOGIN_BROWSER_PATH,
+    extension_path: Optional[Path] = None,
     progress_callback: Optional[Callable[[Result, int, int], None]] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> CheckerRunSummary:
@@ -1600,6 +1744,9 @@ async def run_checker(
     proxies_file = Path(proxies_file)
     output_dir = Path(output_dir)
     browser_path = Path(browser_path)
+    extension_path = Path(extension_path).resolve() if extension_path else None
+    if extension_path and not (extension_path.is_dir() and (extension_path / "manifest.json").is_file()):
+        raise ValueError(f"Extension folder must contain manifest.json: {extension_path}")
     profiles_dir = output_dir / ".temporary_profiles"
 
     logger.info("=" * 55)
@@ -1607,6 +1754,8 @@ async def run_checker(
     logger.info("=" * 55)
     logger.info(f"  Concurrency: {concurrency}")
     logger.info(f"  Output: {output_dir}")
+    if extension_path:
+        logger.info(f"  Extension: {extension_path}")
     logger.info("=" * 55)
 
     # Load accounts
@@ -1639,6 +1788,7 @@ async def run_checker(
             proxy_info=proxy_info,
             browser_path=browser_path,
             profiles_dir=profiles_dir,
+            extension_path=extension_path,
         )
         return index, result
 
