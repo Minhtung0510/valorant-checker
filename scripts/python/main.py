@@ -100,7 +100,8 @@ RIOT_PLATFORM = (
 UUID_SKINS = "e7c63390-eda7-46e0-bb7a-a6abdacd2433"
 
 RANK_NAMES = [
-    "Unrated","Iron 1","Iron 2","Iron 3",
+    "Unrated", "Unrated", "Unrated",
+    "Iron 1","Iron 2","Iron 3",
     "Bronze 1","Bronze 2","Bronze 3",
     "Silver 1","Silver 2","Silver 3",
     "Gold 1","Gold 2","Gold 3",
@@ -1564,12 +1565,16 @@ async def get_account_data(
                 return {}
         
         # Gọi song song các API cơ bản
-        userinfo, wallet, mmr, skins, xp = await asyncio.gather(
+        userinfo, wallet, mmr, skins, xp, ranked_restrictions = await asyncio.gather(
             get("https://auth.riotgames.com/userinfo", "userinfo"),
             get(f"https://pd.{region}.a.pvp.net/store/v1/wallet/{puuid}", "wallet"),
             get_mmr(f"https://pd.{region}.a.pvp.net/mmr/v1/players/{puuid}"),
             get(f"https://pd.{region}.a.pvp.net/store/v1/entitlements/{puuid}/{UUID_SKINS}", "skins"),
             get(f"https://pd.{region}.a.pvp.net/account-xp/v1/players/{puuid}", "account-xp"),
+            get(
+                f"https://pd.{region}.a.pvp.net/restrictions/v1/players/{puuid}/restrictions",
+                "competitive-restrictions",
+            ),
         )
 
         if not userinfo:
@@ -1679,6 +1684,29 @@ async def get_account_data(
         elif userinfo.get("AccountFlag") and userinfo.get("AccountFlag") != 0:
             account_status = "flagged"
             account_status_label = f"⚠️ FLAGGED: {userinfo['AccountFlag']}"
+        # Competitive restrictions are independent of userinfo.ban. Only let them
+        # replace ACTIVE so a real account ban always keeps the higher priority.
+        # Verification/phone restrictions are kept separate from ordinary queue locks.
+        if account_status == "active" and isinstance(ranked_restrictions, dict):
+            raw_restrictions = ranked_restrictions.get("restrictions", [])
+            if isinstance(raw_restrictions, list) and raw_restrictions:
+                restriction_keys = []
+                for restriction in raw_restrictions:
+                    if not isinstance(restriction, dict):
+                        continue
+                    key = restriction.get("type") or restriction.get("reason")
+                    if key:
+                        restriction_keys.append(str(key))
+
+                if restriction_keys:
+                    restriction_text = "; ".join(restriction_keys)
+                    restriction_upper = restriction_text.upper()
+                    if "VERIFY" in restriction_upper or "VERIFICATION" in restriction_upper or "PHONE" in restriction_upper:
+                        account_status = "competitive_verify"
+                        account_status_label = f"🟠 COMPETITIVE VERIFY: {restriction_text}"
+                    else:
+                        account_status = "competitive_restricted"
+                        account_status_label = f"🟠 COMPETITIVE RESTRICTED: {restriction_text}"
         
         return {
             "game_name": game_name,
@@ -1834,7 +1862,8 @@ async def process_account(
 def generate_account_html(r: Result) -> str:
     """Tạo chi tiết tài khoản giống giao diện webapp."""
     is_err = not r.ok or r.status in (
-        "banned", "time_ban", "flagged", "error", "auth_fail",
+        "banned", "time_ban", "flagged", "competitive_verify",
+        "competitive_restricted", "error", "auth_fail",
         "email_verification", "wrong_credentials_or_legacy",
     )
     if is_err:
@@ -2003,7 +2032,8 @@ def save_results(
     # ── Phân loại tài khoản ──
     def _is_error(r: Result) -> bool:
         return not r.ok or r.status in (
-            "banned", "time_ban", "flagged", "error", "auth_fail",
+            "banned", "time_ban", "flagged", "competitive_verify",
+            "competitive_restricted", "error", "auth_fail",
             "email_verification", "wrong_credentials_or_legacy",
         )
     
@@ -2202,10 +2232,20 @@ def load_accounts(accounts_file: Optional[Path] = None) -> list[Account]:
         return []
     
     accounts = []
+    seen_usernames: set[str] = set()
+    duplicate_count = 0
     for line in source.read_text(encoding="utf-8").splitlines():
         acc = Account.parse(line)
         if acc:
+            key = acc.username.strip().casefold()
+            if key in seen_usernames:
+                duplicate_count += 1
+                continue
+            seen_usernames.add(key)
             accounts.append(acc)
+
+    if duplicate_count:
+        logger.warning(f"Skipped {duplicate_count} duplicate account(s) by username")
     
     return accounts
 

@@ -24,6 +24,7 @@ if (-not $Iscc) {
 
 Push-Location $Base
 try {
+    # Bước 1: Build app chính
     python -m PyInstaller `
         --noconfirm `
         --clean `
@@ -31,6 +32,7 @@ try {
         --workpath (Join-Path $InstallerDir "build-package") `
         ValorantChecker.spec
 
+    # Bước 2: Build installer
     & $Iscc "/DOrbitaSource=$OrbitaSource" (Join-Path $InstallerDir "ValorantChecker.iss")
 } finally {
     Pop-Location

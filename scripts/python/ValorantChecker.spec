@@ -8,10 +8,12 @@ base = Path.cwd()
 playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all("playwright")
 
 a = Analysis(
-    [str(base / "desktop_app.py")],
+    [str(base / "qt_desktop_app.py")],
     pathex=[str(base)],
     binaries=playwright_binaries,
-    datas=playwright_datas + [(str(base / "license_public_key.pem"), ".")],
+    datas=playwright_datas + [
+        (str(base / "assets" / "app-mark.png"), "assets"),
+    ],
     hiddenimports=playwright_hiddenimports,
     hookspath=[],
     hooksconfig={},
