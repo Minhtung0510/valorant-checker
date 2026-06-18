@@ -31,6 +31,11 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 QSS = """
 * { font-family: 'Segoe UI'; color: #e9eef5; }
 QMainWindow, QWidget#root { background: #081421; }
+QDialog { background: #0b1927; color: #e9eef5; }
+QDialog QLabel { background: transparent; color: #e9eef5; }
+QDialog QLabel#muted { color: #8294a8; font-weight: 600; }
+QDialog QLabel#detailTitle { color: #ff5263; font-size: 18px; font-weight: 800; padding-bottom: 8px; }
+QDialog QDialogButtonBox { background: transparent; }
 QFrame#sidebar { background: #091827; border-right: 1px solid #1b3045; }
 QFrame#card { background: #0e1d2d; border: 1px solid #20364c; border-radius: 10px; }
 QFrame#actionBar { background: #102235; border: 1px solid #263e55; border-radius: 9px; }
@@ -719,13 +724,17 @@ class MainWindow(QMainWindow):
         rank = f"{tier} • {result.rr} RR" if result.tier else "Unrated"
         riot_id = f"{result.game_name}#{result.tag_line}" if result.game_name else "—"
         dialog = QDialog(self)
+        dialog.setObjectName("detailDialog")
         dialog.setWindowTitle(f"Chi tiết account • {result.username}")
         dialog.setMinimumWidth(560)
         layout = QVBoxLayout(dialog)
-        heading = QLabel("CHI TIẾT ACCOUNT", objectName="section")
+        layout.setContentsMargins(24, 22, 24, 18)
+        layout.setSpacing(12)
+        heading = QLabel("CHI TIẾT ACCOUNT", objectName="detailTitle")
         layout.addWidget(heading)
         form = QFormLayout()
         form.setHorizontalSpacing(24)
+        form.setVerticalSpacing(11)
         details = (
             ("Account", result.username),
             ("Riot ID", riot_id),
