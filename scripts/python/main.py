@@ -43,6 +43,13 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import httpx
+import psutil
+from nopecha_solver import NopechaSolver
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
 # Setup logging
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
@@ -65,6 +72,9 @@ logger.addHandler(fh)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SCRIPT_DIR = Path(__file__).parent
+if load_dotenv:
+    load_dotenv(SCRIPT_DIR / ".env")
+
 ACCOUNTS_FILE = SCRIPT_DIR / "accounts.txt"
 PROFILES_CACHE = SCRIPT_DIR / "profiles_cache.json"
 PROFILES_DIR = SCRIPT_DIR / "profiles"
@@ -195,6 +205,8 @@ class Result:
     rp: int = 0
     kc: int = 0
     skins_count: int = 0
+    skin_names: list[str] = field(default_factory=list)
+    skin_details: list[dict[str, str]] = field(default_factory=list)
     status: str = "error"
     status_label: str = "❌ ERROR"
     error: str = ""
@@ -254,14 +266,16 @@ class GoLoginBrowser:
         self._pw_context_manager = None
         self._proxy: Optional[ProxyInfo] = proxy_info
         self._cdp_session = None
+        self._gologin = None
         self._profile_dir: Optional[Path] = None
         self._browser_path = browser_path or GOLOGIN_BROWSER_PATH
         self._profiles_dir = profiles_dir or PROFILES_DIR
         self._extension_path = Path(extension_path).resolve() if extension_path else None
+        self.login_failure: Optional[tuple[str, str, str]] = None
 
     def _extension_args(self) -> list[str]:
         if not self._extension_path:
-            return []
+            return ["--disable-extensions"]
 
         extension_dir = str(self._extension_path)
         return [
@@ -280,6 +294,12 @@ class GoLoginBrowser:
                 logger.warning("  Extension path is ignored when connecting to an existing ws_url browser")
             return await self._connect_ws(self.account.ws_url)
 
+        if self.account.profile_id and os.getenv("GOLOGIN_TOKEN", "").strip():
+            connected = await self._start_gologin_profile()
+            if connected:
+                return True
+            logger.warning(f"  GoLogin profile start failed for {self.account.username}; falling back to direct Orbita launch")
+
         # Configure authenticated proxies before Chromium creates its first
         # HTTPS tunnel. Supplying credentials later through CDP is unreliable.
         if self._proxy and self._proxy.username:
@@ -287,6 +307,47 @@ class GoLoginBrowser:
         
         # Tự launch Orbita browser
         return await self._launch_and_connect()
+
+    async def _start_gologin_profile(self) -> bool:
+        """Start an existing GoLogin profile through the official SDK."""
+        try:
+            from gologin import GoLogin
+        except ImportError:
+            logger.error("  GoLogin SDK is not installed. Run: pip install gologin")
+            return False
+
+        if self._proxy:
+            logger.info("  Using proxy configured inside GoLogin profile; proxies.txt is ignored for SDK-started profiles")
+        if self._extension_path:
+            logger.info("  Extension path is ignored for SDK-started GoLogin profiles; install it inside the GoLogin profile")
+
+        options = {
+            "token": os.getenv("GOLOGIN_TOKEN", "").strip(),
+            "profile_id": self.account.profile_id,
+            "executablePath": str(self._browser_path),
+        }
+        try:
+            logger.info(f"  Starting GoLogin profile {self.account.profile_id} for {self.account.username}")
+            self._gologin = GoLogin(options)
+            debugger_address = await asyncio.to_thread(self._gologin.start)
+            if not debugger_address:
+                logger.error("  GoLogin SDK returned no debugger address")
+                return False
+
+            cdp_url = str(debugger_address)
+            if not cdp_url.startswith(("http://", "https://", "ws://", "wss://")):
+                cdp_url = f"http://{cdp_url}"
+            logger.info(f"  GoLogin profile ready: {cdp_url}")
+            return await self._connect_ws(cdp_url)
+        except Exception as exc:
+            logger.error(f"  GoLogin profile start error: {exc}")
+            try:
+                if self._gologin:
+                    await asyncio.to_thread(self._gologin.stop)
+            except Exception:
+                pass
+            self._gologin = None
+            return False
 
     async def _launch_persistent_with_proxy(self) -> bool:
         chrome_exe = self._browser_path
@@ -372,7 +433,8 @@ class GoLoginBrowser:
             cmd.insert(-1, f"--proxy-server={self._proxy.server}")
         
         proxy_log = f" via proxy {self._proxy.server}" if self._proxy else ""
-        logger.info(f"  Launching Orbita on port {self._port} for {self.account.username}{proxy_log}")
+        extension_log = f" with extension {self._extension_path}" if self._extension_path else ""
+        logger.info(f"  Launching Orbita on port {self._port} for {self.account.username}{proxy_log}{extension_log}")
         
         try:
             self._process = _subprocess.Popen(
@@ -429,21 +491,61 @@ class GoLoginBrowser:
         """Setup browser context và page."""
         if not self.browser:
             return
-        
+
         if self.browser.contexts:
             self.context = self.browser.contexts[0]
         else:
             self.context = await self.browser.new_context()
-        
+
         if self.context.pages:
             self.page = self.context.pages[0]
         else:
             self.page = await self.context.new_page()
-        
+
         # Setup proxy authentication nếu có proxy với credentials
         if self._proxy and self._proxy.username:
             await self._setup_proxy_auth()
-    
+
+        # Inject NopeCHA API key vào extension
+        await self._inject_nopecha_key()
+
+    async def _inject_nopecha_key(self):
+        """Inject NopeCHA API key vào extension qua Magic URL method.
+
+        Navigate đến https://nopecha.com/setup#{key} - extension sẽ tự động
+        đọc key từ URL hash và lưu vào settings.
+        """
+        nopecha_key = os.getenv("NOPECHA_API_KEY", "").strip()
+        if not nopecha_key or not self.page:
+            if not nopecha_key:
+                # Try to read API key from the answer file as fallback
+                try:
+                    from pathlib import Path
+                    answer_path = Path(r"C:\Users\WORK\valorant-checker\scripts\câu trả lời.txt")
+                    if answer_path.is_file():
+                        for line in answer_path.read_text(encoding="utf-8").splitlines():
+                            if "API Key" in line:
+                                # Expected format: API Key : <key>
+                                parts = line.split(":", 1)
+                                if len(parts) == 2:
+                                    extracted = parts[1].strip()
+                                    if extracted:
+                                        nopecha_key = extracted
+                                        logger.debug("  Loaded NOPECHA_API_KEY from answer file")
+                                        break
+                except Exception as e:
+                    logger.debug(f"  Failed to load API key from answer file: {e}")
+                if not nopecha_key:
+                    logger.debug("  NOPECHA_API_KEY not set, skipping NopeCHA injection")
+            return
+
+        try:
+            await self.page.goto(f"https://nopecha.com/setup#{nopecha_key}", timeout=10000)
+            await asyncio.sleep(2)
+            logger.info(f"  NopeCHA key injected via Magic URL for {self.account.username}")
+        except Exception as e:
+            logger.warning(f"  NopeCHA Magic URL injection error: {e}")
+
     async def _setup_proxy_auth(self):
         """Tự động xác thực proxy qua CDP Fetch domain.
         
@@ -508,6 +610,50 @@ class GoLoginBrowser:
                     pass
             self._process = None
 
+    def _kill_process_tree(self):
+        """Force-kill the browser process tree when graceful shutdown hangs."""
+        target_pids: set[int] = set()
+        if self._process:
+            target_pids.add(self._process.pid)
+
+        profile_arg = str(self._profile_dir).lower() if self._profile_dir else ""
+        port_arg = f"--remote-debugging-port={self._port}" if self._port else ""
+        for process in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                command_line = " ".join(process.info.get("cmdline") or []).lower()
+                if (profile_arg and profile_arg in command_line) or (port_arg and port_arg in command_line):
+                    target_pids.add(process.info["pid"])
+            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                continue
+
+        for pid in sorted(target_pids, reverse=True):
+            try:
+                process = psutil.Process(pid)
+                children = process.children(recursive=True)
+                for child in reversed(children):
+                    try:
+                        child.kill()
+                    except (psutil.AccessDenied, psutil.NoSuchProcess):
+                        pass
+                process.kill()
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
+
+        if target_pids:
+            remaining = []
+            for pid in target_pids:
+                try:
+                    remaining.append(psutil.Process(pid))
+                except psutil.NoSuchProcess:
+                    pass
+            _, alive = psutil.wait_procs(remaining, timeout=3)
+            for process in alive:
+                try:
+                    process.kill()
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    pass
+        self._process = None
+
     async def _delete_temporary_profile(self):
         """Xóa profile do script tự tạo sau khi browser đã đóng."""
         profile_dir = self._profile_dir
@@ -528,27 +674,41 @@ class GoLoginBrowser:
     
     async def disconnect(self):
         """Ngắt kết nối và kill browser."""
+        async def close_gracefully():
+            try:
+                if self._cdp_session:
+                    await self._cdp_session.detach()
+            except Exception:
+                pass
+            try:
+                if self.browser and not self._process:
+                    await self.browser.close()
+            except Exception:
+                pass
+            try:
+                if self.context and not self.browser:
+                    await self.context.close()
+            except Exception:
+                pass
+            try:
+                if self._pw_context_manager:
+                    await self._pw_context_manager.__aexit__(None, None, None)
+            except Exception:
+                pass
+
         try:
-            if self._cdp_session:
-                await self._cdp_session.detach()
-        except:
-            pass
-        try:
-            if self.browser:
-                await self.browser.close()
-        except:
-            pass
-        try:
-            if self.context and not self.browser:
-                await self.context.close()
-        except:
-            pass
-        try:
-            if self._pw_context_manager:
-                await self._pw_context_manager.__aexit__(None, None, None)
-        except:
-            pass
-        self._kill_process()
+            await asyncio.wait_for(close_gracefully(), timeout=4)
+        except asyncio.TimeoutError:
+            logger.warning(f"  Browser close timed out for {self.account.username}; killing process tree")
+        finally:
+            if self._gologin:
+                try:
+                    await asyncio.to_thread(self._gologin.stop)
+                    logger.info(f"  Stopped GoLogin profile for {self.account.username}")
+                except Exception as exc:
+                    logger.warning(f"  GoLogin profile stop failed for {self.account.username}: {exc}")
+                self._gologin = None
+            await asyncio.to_thread(self._kill_process_tree)
         await self._delete_temporary_profile()
     
     async def is_logged_in(self) -> bool:
@@ -586,7 +746,7 @@ class GoLoginBrowser:
     async def get_tokens(self) -> Optional[dict]:
         """
         Lấy tokens từ GoLogin browser.
-        Ưu tiên: cookies → lockfile → browser login
+        Ưu tiên: cookies -> lockfile -> browser login
         """
         if not self.context:
             return None
@@ -651,12 +811,12 @@ class GoLoginBrowser:
                     return None
                 
                 data = r.json()
-                
+
                 # Check captcha
                 if data.get("captcha"):
                     logger.warning("  Captcha required")
                     return None
-                
+
                 # Get session_token
                 session_token = data.get("session_token") or data.get("success", {}).get("session_token")
                 
@@ -873,6 +1033,229 @@ class GoLoginBrowser:
             pass
         
         return None
+
+    async def _find_hcaptcha_sitekey(self) -> Optional[str]:
+        if not self.page:
+            return None
+
+        try:
+            return await self.page.evaluate(
+                """() => {
+                    const selectors = [
+                        "[data-sitekey]",
+                        "iframe[src*='hcaptcha.com'][src*='sitekey=']",
+                        "iframe[src*='newassets.hcaptcha.com'][src*='sitekey=']"
+                    ];
+
+                    for (const selector of selectors) {
+                        for (const el of document.querySelectorAll(selector)) {
+                            const direct = el.getAttribute("data-sitekey");
+                            if (direct) return direct;
+
+                            const src = el.getAttribute("src");
+                            if (src) {
+                                try {
+                                    const parsed = new URL(src, window.location.href);
+                                    const sitekey = parsed.searchParams.get("sitekey");
+                                    if (sitekey) return sitekey;
+                                } catch (_) {}
+                            }
+                        }
+                    }
+
+                    const html = document.documentElement.innerHTML;
+                    const match = html.match(/sitekey["'\\s:=]+([0-9a-fA-F-]{20,})/);
+                    return match ? match[1] : null;
+                }"""
+            )
+        except Exception as exc:
+            logger.debug(f"  hCaptcha sitekey detection failed: {exc}")
+            return None
+
+    async def _find_hcaptcha_rqdata(self) -> str:
+        if not self.page:
+            return ""
+
+        try:
+            return await self.page.evaluate(
+                """() => {
+                    const sources = [
+                        ...Array.from(document.querySelectorAll("iframe[src*='hcaptcha']")).map(el => el.src || ""),
+                        document.documentElement.innerHTML
+                    ];
+
+                    for (const source of sources) {
+                        try {
+                            const parsed = new URL(source, window.location.href);
+                            const rqdata = parsed.searchParams.get("rqdata");
+                            if (rqdata) return rqdata;
+                        } catch (_) {}
+
+                        const match = source.match(/["']rqdata["']\\s*:\\s*["']([^"']+)["']/);
+                        if (match) return match[1];
+                    }
+                    return "";
+                }"""
+            ) or ""
+        except Exception as exc:
+            logger.debug(f"  hCaptcha rqdata detection failed: {exc}")
+            return ""
+
+    async def _browser_user_agent(self) -> str:
+        if not self.page:
+            return ""
+
+        try:
+            return await self.page.evaluate("() => navigator.userAgent") or ""
+        except Exception:
+            return ""
+
+    def _nopecha_proxy_payload(self) -> Optional[dict]:
+        proxy = self._proxy
+        if not proxy:
+            return None
+
+        payload = {
+            "scheme": "http",
+            "host": proxy.host,
+            "port": str(proxy.port),
+        }
+        if proxy.username:
+            payload["username"] = proxy.username
+            payload["password"] = proxy.password
+        return payload
+
+    async def _inject_hcaptcha_token(self, token: str) -> bool:
+        if not self.page:
+            return False
+
+        try:
+            return await self.page.evaluate(
+                """(token) => {
+                    const responseNames = ["h-captcha-response", "g-recaptcha-response"];
+
+                    for (const name of responseNames) {
+                        let fields = Array.from(document.querySelectorAll(`[name="${name}"]`));
+                        if (!fields.length) {
+                            const textarea = document.createElement("textarea");
+                            textarea.name = name;
+                            textarea.style.display = "none";
+                            document.body.appendChild(textarea);
+                            fields = [textarea];
+                        }
+
+                        for (const field of fields) {
+                            field.value = token;
+                            field.innerHTML = token;
+                            field.dispatchEvent(new Event("input", { bubbles: true }));
+                            field.dispatchEvent(new Event("change", { bubbles: true }));
+                        }
+                    }
+
+                    let callbackCalled = false;
+                    const cfg = window.___grecaptcha_cfg;
+                    if (cfg && cfg.clients) {
+                        const visit = (obj, seen = new Set()) => {
+                            if (!obj || typeof obj !== "object" || seen.has(obj)) return;
+                            seen.add(obj);
+                            for (const [key, value] of Object.entries(obj)) {
+                                if (typeof value === "function" && key.toLowerCase().includes("callback")) {
+                                    try {
+                                        value(token);
+                                        callbackCalled = true;
+                                    } catch (_) {}
+                                } else if (value && typeof value === "object") {
+                                    visit(value, seen);
+                                }
+                            }
+                        };
+                        visit(cfg.clients);
+                    }
+
+                    window.dispatchEvent(new Event("captcha-solved"));
+                    return true;
+                }""",
+                token,
+            )
+        except Exception as exc:
+            logger.warning(f"  Failed to inject hCaptcha token: {exc}")
+            return False
+
+    async def _solve_hcaptcha_if_present(self) -> Optional[bool]:
+        """
+        Phát hiện hCaptcha và để extension NopeCHA tự động giải.
+        Extension sẽ tự động inject solution vào page.
+        """
+        if not self.page:
+            return None
+
+        sitekey = await self._find_hcaptcha_sitekey()
+        if not sitekey:
+            return None
+
+        api_key = os.getenv("NOPECHA_API_KEY", "").strip()
+        if not api_key:
+            logger.warning("  hCaptcha detected but NOPECHA_API_KEY is not configured")
+            return False
+
+        logger.info(f"  hCaptcha detected (sitekey: {sitekey[:20]}...) - waiting for NopeCHA extension to solve...")
+
+        # Đợi extension NopeCHA tự động giải captcha
+        # Extension sẽ tự động detect hCaptcha iframe và submit solution
+        max_wait = 120  # 2 phút
+        check_interval = 2  # Check mỗi 2 giây
+
+        for attempt in range(max_wait // check_interval):
+            await asyncio.sleep(check_interval)
+
+            # Check xem captcha đã biến mất chưa (dấu hiệu đã được giải)
+            captcha_gone = await self.page.evaluate(
+                """() => {
+                    // Check nếu hCaptcha iframe không còn hoặc đã hidden
+                    const hcaptchaIframes = document.querySelectorAll('iframe[src*="hcaptcha"]');
+                    if (hcaptchaIframes.length === 0) return true;
+
+                    // Check nếu có response token
+                    const responseField = document.querySelector('[name="h-captcha-response"]');
+                    if (responseField && responseField.value && responseField.value.length > 50) {
+                        return true;
+                    }
+
+                    // Check nếu captcha container đã hidden
+                    for (const iframe of hcaptchaIframes) {
+                        const container = iframe.closest('[class*="captcha"], [id*="captcha"]');
+                        if (container) {
+                            const style = window.getComputedStyle(container);
+                            if (style.display === 'none' || style.visibility === 'hidden') {
+                                return true;
+                            }
+                        }
+                    }
+
+                    return false;
+                }"""
+            )
+
+            if captcha_gone:
+                logger.info(f"  NopeCHA extension solved hCaptcha for {self.account.username} (after {attempt * check_interval}s)")
+
+                # Click submit button nếu có
+                try:
+                    submit_btn = await self.page.query_selector('button[data-testid="btn-signin-submit"]')
+                    if submit_btn and await submit_btn.is_visible():
+                        await submit_btn.click()
+                        logger.info(f"  Clicked submit button for {self.account.username}")
+                except Exception as e:
+                    logger.debug(f"  Submit button click error: {e}")
+
+                return True
+
+            # Log tiến độ mỗi 10 giây
+            if attempt % 5 == 0 and attempt > 0:
+                logger.debug(f"  Still waiting for NopeCHA extension... ({attempt * check_interval}s)")
+
+        logger.warning(f"  NopeCHA extension did not solve hCaptcha within {max_wait}s for {self.account.username}")
+        return False
     
     async def do_login(self) -> Optional[dict]:
         """Đăng nhập trực tiếp trên browser."""
@@ -904,6 +1287,8 @@ class GoLoginBrowser:
             
             username_filled = False
             password_filled = False
+            captcha_solved = False
+            captcha_attempted = False
             
             logger.info(f"  Waiting for login completion for {self.account.username} (max 180s)...")
             
@@ -915,8 +1300,49 @@ class GoLoginBrowser:
                 url = self.page.url
                 if "access_token=" in url:
                     return await self._parse_token_from_url(url)
-                
-                # 2. Điền username tự động nếu thấy ô nhập
+
+                if not captcha_solved and not captcha_attempted and attempt % 4 == 0:
+                    captcha_result = await self._solve_hcaptcha_if_present()
+                    if captcha_result is not None:
+                        captcha_attempted = True
+                        captcha_solved = captcha_result
+
+                # Detect terminal login states early instead of waiting 180 seconds.
+                if attempt % 2 == 0:
+                    try:
+                        page_text = (await self.page.locator("body").inner_text(timeout=1_000)).lower()
+                        if (
+                            "verification required" in page_text
+                            and "enter the code" in page_text
+                            and "emailed" in page_text
+                        ):
+                            self.login_failure = (
+                                "email_verification",
+                                "⚠ EMAIL VERIFICATION",
+                                "Riot requires a verification code sent by email",
+                            )
+                            logger.warning(f"  Email verification required for {self.account.username}")
+                            return None
+
+                        credential_message = (
+                            "your username or password may be incorrect"
+                            in page_text
+                        )
+                        legacy_message = (
+                            "you may need to update to a riot account"
+                            in page_text
+                        )
+                        if credential_message or legacy_message:
+                            self.login_failure = (
+                                "wrong_credentials_or_legacy",
+                                "❌ WRONG LOGIN / LEGACY",
+                                "Username/password is incorrect or the account requires a Riot Account update",
+                            )
+                            logger.warning(f"  Wrong credentials or legacy account: {self.account.username}")
+                            return None
+                    except Exception:
+                        pass
+
                 if not username_filled:
                     try:
                         username_input = await self.page.query_selector('input[name="username"]')
@@ -926,16 +1352,14 @@ class GoLoginBrowser:
                                 await username_input.fill(self.account.username)
                                 username_filled = True
                                 logger.info(f"  Filled username for {self.account.username}")
-                                
-                                # Chỉ nhấn Enter nếu ô password chưa xuất hiện (multi-step login)
+
                                 password_input = await self.page.query_selector('input[name="password"]')
                                 if not password_input or not await password_input.is_visible():
                                     await self.page.keyboard.press("Enter")
-                                    logger.info(f"  Pressed Enter on username (multi-step layout)")
-                    except:
+                                    logger.info("  Pressed Enter on username step")
+                    except Exception:
                         pass
-                
-                # 3. Điền password tự động nếu thấy ô nhập
+
                 if not password_filled:
                     try:
                         password_input = await self.page.query_selector('input[name="password"]')
@@ -1016,7 +1440,7 @@ class GoLoginBrowser:
 
 
 # Bản đồ ánh xạ level_uuid -> base_skin_name
-VALORANT_SKINS_MAP: dict[str, str] = {}
+VALORANT_SKINS_MAP: dict[str, dict[str, str]] = {}
 
 async def load_valorant_skins_map(api_request=None):
     """Tải danh sách skin từ valorant-api.com và ánh xạ các level về skin gốc."""
@@ -1034,10 +1458,14 @@ async def load_valorant_skins_map(api_request=None):
 
         for skin in payload.get("data", []):
             base_name = skin.get("displayName", "")
+            base_image = skin.get("displayIcon") or ""
             for level in skin.get("levels", []):
                 lvl_uuid = level.get("uuid")
                 if lvl_uuid:
-                    VALORANT_SKINS_MAP[lvl_uuid.lower()] = base_name
+                    VALORANT_SKINS_MAP[lvl_uuid.lower()] = {
+                        "name": base_name,
+                        "image": level.get("displayIcon") or base_image,
+                    }
         if VALORANT_SKINS_MAP:
             logger.info(f"Loaded {len(VALORANT_SKINS_MAP)} skin levels into map")
         else:
@@ -1175,15 +1603,17 @@ async def get_account_data(
             tier = int(comp.get("TierAfterUpdate", 0))
             rr = int(comp.get("RankedRatingAfterUpdate", 0))
         
-        # Deduplicate skins by mapping level UUID to base skin name
-        seen_skins = set()
+        # Deduplicate skin levels into their base skin and retain display artwork.
+        seen_skins: dict[str, dict[str, str]] = {}
         for ent in skins.get("Entitlements", []):
             item_id = ent.get("ItemID", "").lower()
-            base_name = VALORANT_SKINS_MAP.get(item_id)
-            if base_name:
-                seen_skins.add(base_name)
+            skin_detail = VALORANT_SKINS_MAP.get(item_id)
+            if skin_detail and skin_detail.get("name"):
+                seen_skins.setdefault(skin_detail["name"], skin_detail)
         
-        skins_count = len(seen_skins) if VALORANT_SKINS_MAP else len(skins.get("Entitlements", []))
+        skin_details = sorted(seen_skins.values(), key=lambda item: item["name"].casefold())
+        skin_names = [item["name"] for item in skin_details]
+        skins_count = len(skin_names) if VALORANT_SKINS_MAP else len(skins.get("Entitlements", []))
         
         level = xp.get("Progress", {}).get("Level", xp.get("Level", 0))
         
@@ -1261,6 +1691,8 @@ async def get_account_data(
             "tier": tier,
             "rr": rr,
             "skins_count": skins_count,
+            "skin_names": skin_names,
+            "skin_details": skin_details,
             "region": region,
             "account_status": account_status,
             "account_status_label": account_status_label,
@@ -1317,6 +1749,16 @@ async def process_account(
                 tokens = await browser.do_login()
             
             if not tokens:
+                if browser.login_failure:
+                    status, status_label, error = browser.login_failure
+                    return Result(
+                        ok=False,
+                        username=account.username,
+                        password=account.password,
+                        status=status,
+                        status_label=status_label,
+                        error=error,
+                    )
                 return Result(
                     ok=False,
                     username=account.username,
@@ -1357,6 +1799,8 @@ async def process_account(
                 rp=data["rp"],
                 kc=data["kc"],
                 skins_count=data["skins_count"],
+                skin_names=data.get("skin_names", []),
+                skin_details=data.get("skin_details", []),
                 status=data["account_status"],
                 status_label=data["account_status_label"],
                 country=data.get("country", ""),
@@ -1376,7 +1820,11 @@ async def process_account(
                 error=str(e),
             )
         finally:
-            await browser.disconnect()
+            try:
+                await asyncio.shield(browser.disconnect())
+            except asyncio.CancelledError:
+                logger.warning(f"  Cleanup was interrupted for {account.username}")
+                raise
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1385,7 +1833,10 @@ async def process_account(
 
 def generate_account_html(r: Result) -> str:
     """Tạo chi tiết tài khoản giống giao diện webapp."""
-    is_err = not r.ok or r.status in ("banned", "time_ban", "flagged", "error", "auth_fail")
+    is_err = not r.ok or r.status in (
+        "banned", "time_ban", "flagged", "error", "auth_fail",
+        "email_verification", "wrong_credentials_or_legacy",
+    )
     if is_err:
         cat_label = "Lỗi / Bị Ban"
         cat_color = "#ff5252"
@@ -1425,6 +1876,21 @@ def generate_account_html(r: Result) -> str:
     phone_status = "Yes" if r.phone_verified else "No"
     
     status_badge = f"<span class='green-badge'>Active</span>" if r.status == "active" else f"<span class='red-badge'>{status_lbl_esc}</span>"
+    skin_details = r.skin_details or [{"name": name, "image": ""} for name in r.skin_names]
+    skin_items = "".join(
+        f'''<article class="skin-item">
+          <div class="skin-art">
+            {f'<img src="{html.escape(item.get("image", ""), quote=True)}" alt="{html.escape(item.get("name", ""), quote=True)}" loading="lazy">' if item.get("image") else '<span class="skin-placeholder">No image</span>'}
+          </div>
+          <div class="skin-name">{html.escape(item.get("name", "Unknown skin"))}</div>
+        </article>'''
+        for item in skin_details
+    )
+    skins_section = f"""
+  <div class="card skins-card">
+    <h3>Skin Collection ({r.skins_count})</h3>
+    <div class="skin-grid">{skin_items or '<span class="empty-skins">No mapped skin names found.</span>'}</div>
+  </div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="vi">
@@ -1461,6 +1927,14 @@ main{{max-width:1100px;margin:0 auto;padding:20px 24px}}
 .stat-row .s .l{{color:#8b978f;font-size:.8em}}
 .cat-badge{{display:inline-block;padding:3px 12px;border-radius:12px;font-size:.8em;font-weight:700;border:1px solid {cat_color};color:{cat_color};background:transparent}}
 .cat-badge.error-badge{{border-color:#ff5252;color:#ff5252}}
+.skins-card{{margin-bottom:16px}}
+.skin-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(175px,1fr));gap:12px}}
+.skin-item{{overflow:hidden;background:linear-gradient(145deg,#171b21,#0d1117);border:1px solid #70404a;border-radius:10px;min-width:0;box-shadow:0 5px 16px rgba(0,0,0,.2)}}
+.skin-art{{height:125px;display:flex;align-items:center;justify-content:center;padding:12px;background:radial-gradient(circle at center,#242b35 0,#10161e 72%)}}
+.skin-art img{{display:block;width:100%;height:100%;object-fit:contain;filter:drop-shadow(0 8px 8px rgba(0,0,0,.55))}}
+.skin-placeholder{{color:#65717d;font-size:.75em}}
+.skin-name{{min-height:46px;display:flex;align-items:center;justify-content:center;padding:9px 8px;border-top:1px solid #70404a;color:#ece8e1;font-size:.79em;font-weight:650;text-align:center}}
+.empty-skins{{color:#8b978f;font-size:.85em}}
 footer{{text-align:center;color:#8b978f;font-size:.78em;padding:20px;border-top:1px solid #2a3a4a;margin-top:20px}}
 footer a{{color:#ff4655;text-decoration:none}}
 @media(max-width:700px){{.two-col{{grid-template-columns:1fr}}.wallet-grid{{grid-template-columns:1fr 1fr}}}}
@@ -1505,6 +1979,7 @@ footer a{{color:#ff4655;text-decoration:none}}
       </div>
     </div>
   </div>
+  {skins_section}
   <div style="text-align:center;color:#8b978f;font-size:.78em;margin-top:12px">
     Checked: {datetime.now().strftime("%d/%m/%Y %H:%M:%S")}
   </div>
@@ -1514,23 +1989,46 @@ footer a{{color:#ff4655;text-decoration:none}}
 </html>"""
 
 
-def save_results(results: list[Result], output_dir: Optional[Path] = None) -> Path:
+def save_results(
+    results: list[Result],
+    output_dir: Optional[Path] = None,
+    run_dir: Optional[Path] = None,
+) -> Path:
     """Lưu kết quả ra HTML + phân loại theo skin count."""
-    ts = datetime.now().strftime("%d%m%Y_%H%M%S")
-    run_dir = (output_dir or OUTPUT_DIR) / f"check_{ts}"
+    if run_dir is None:
+        ts = datetime.now().strftime("%d%m%Y_%H%M%S")
+        run_dir = (output_dir or OUTPUT_DIR) / f"check_{ts}"
     run_dir.mkdir(parents=True, exist_ok=True)
     
     # ── Phân loại tài khoản ──
     def _is_error(r: Result) -> bool:
-        return not r.ok or r.status in ("banned", "time_ban", "flagged", "error", "auth_fail")
+        return not r.ok or r.status in (
+            "banned", "time_ban", "flagged", "error", "auth_fail",
+            "email_verification", "wrong_credentials_or_legacy",
+        )
     
-    cat_error = [r for r in results if _is_error(r)]
+    cat_email_verification = [r for r in results if r.status == "email_verification"]
+    cat_wrong_login = [r for r in results if r.status == "wrong_credentials_or_legacy"]
+    special_errors = {"email_verification", "wrong_credentials_or_legacy"}
+    cat_error = [r for r in results if _is_error(r) and r.status not in special_errors]
     good = [r for r in results if not _is_error(r)]
     cat_0 = [r for r in good if r.skins_count == 0]
     cat_1_20 = [r for r in good if 1 <= r.skins_count <= 20]
     cat_21_60 = [r for r in good if 21 <= r.skins_count <= 60]
     cat_61_120 = [r for r in good if 61 <= r.skins_count <= 120]
     cat_120plus = [r for r in good if r.skins_count > 120]
+
+    # Keep simple top-level account lists up to date after every completed check.
+    active_accounts = [r for r in results if r.ok and r.status == "active"]
+    dead_accounts = [r for r in results if not (r.ok and r.status == "active")]
+    (run_dir / "active.txt").write_text(
+        "\n".join(f"{r.username}:{r.password}" for r in active_accounts),
+        encoding="utf-8",
+    )
+    (run_dir / "dead.txt").write_text(
+        "\n".join(f"{r.username}:{r.password}" for r in dead_accounts),
+        encoding="utf-8",
+    )
     
     categories = [
         ("0_skins", "0 skins", cat_0, "#8b978f"),
@@ -1538,6 +2036,8 @@ def save_results(results: list[Result], output_dir: Optional[Path] = None) -> Pa
         ("20-60_skins", "20-60 skins", cat_21_60, "#2196f3"),
         ("60-120_skins", "60-120 skins", cat_61_120, "#ff9800"),
         ("120+_skins", "120+ skins", cat_120plus, "#e91e63"),
+        ("email_verification", "email verification", cat_email_verification, "#ffb74d"),
+        ("wrong_credentials_or_legacy", "wrong login / legacy", cat_wrong_login, "#ef5350"),
         ("error", "error", cat_error, "#ff5252"),
     ]
     
@@ -1748,6 +2248,8 @@ async def run_checker(
     if extension_path and not (extension_path.is_dir() and (extension_path / "manifest.json").is_file()):
         raise ValueError(f"Extension folder must contain manifest.json: {extension_path}")
     profiles_dir = output_dir / ".temporary_profiles"
+    run_dir = output_dir / f"check_{datetime.now():%d%m%Y_%H%M%S}"
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("=" * 55)
     logger.info("  VALORANT CHECKER - GoLogin Edition")
@@ -1829,6 +2331,11 @@ async def run_checker(
 
             ordered_results[index] = result
             completed_count += 1
+            current_results = [item for item in ordered_results if item is not None]
+            try:
+                await asyncio.to_thread(save_results, current_results, output_dir, run_dir)
+            except Exception as exc:
+                logger.error(f"Cannot save incremental results: {exc}")
             if progress_callback:
                 try:
                     progress_callback(result, completed_count, len(accounts))
@@ -1838,7 +2345,7 @@ async def run_checker(
     results = [result for result in ordered_results if result is not None]
 
     # Save
-    report_path = save_results(results, output_dir) if results else None
+    report_path = save_results(results, output_dir, run_dir) if results else None
 
     # Summary
     active = sum(1 for r in results if r.ok and r.status == "active")

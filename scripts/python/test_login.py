@@ -27,7 +27,6 @@ BASE_OUTPUT_DIR = r"C:\Users\WORK\Desktop\Check-done"
 LOGS_DIR = "logs"
 
 ORBITA_BROWSER_PATH = r"C:\Users\WORK\Downloads\Gologin\All-Browsers\orbita-browser-145\chrome.exe"
-OMO_EXTENSION_PATH = os.getenv("OMO_EXTENSION_PATH", "").strip()
 
 RIOT_AUTH_URL = (
     "https://auth.riotgames.com/authorize"
@@ -252,17 +251,7 @@ def launch_orbita_browser(port: int, user_data_dir: str, proxy: Optional[ProxyIn
         "--window-size=1280,720",
         "--lang=en-US",
     ]
-    if OMO_EXTENSION_PATH:
-        extension_dir = os.path.abspath(OMO_EXTENSION_PATH)
-        manifest_path = os.path.join(extension_dir, "manifest.json")
-        if not os.path.isdir(extension_dir) or not os.path.isfile(manifest_path):
-            raise ValueError(f"OMO_EXTENSION_PATH must contain manifest.json: {extension_dir}")
-        args.extend([
-            f"--disable-extensions-except={extension_dir}",
-            f"--load-extension={extension_dir}",
-        ])
-    else:
-        args.append("--disable-extensions")
+    args.append("--disable-extensions")
     if proxy:
         args.append(f"--proxy-server={proxy.server}")
     os.makedirs(user_data_dir, exist_ok=True)

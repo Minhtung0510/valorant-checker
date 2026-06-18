@@ -74,6 +74,8 @@ class ValorantCheckerApp:
         self.extension_var = tk.StringVar()
         self.output_var = tk.StringVar(value=str(Path.home() / "Desktop" / "Check-done"))
         self.concurrency_var = tk.IntVar(value=2)
+        self.nopecha_var = tk.StringVar()
+        self.gologin_token_var = tk.StringVar()
         self.accounts_count_var = tk.StringVar(value="Chưa import")
         self.proxies_count_var = tk.StringVar(value="Chưa import")
         self.progress_var = tk.DoubleVar(value=0)
@@ -213,6 +215,8 @@ class ValorantCheckerApp:
         self.extension_var.set(settings.get("extension_path", ""))
         self.output_var.set(settings.get("output_dir", self.output_var.get()))
         self.concurrency_var.set(int(settings.get("concurrency", 2)))
+        self.nopecha_var.set(settings.get("nopecha_api_key", ""))
+        self.gologin_token_var.set(settings.get("gologin_token", ""))
 
     def _save_settings(self) -> None:
         value = {
@@ -222,6 +226,8 @@ class ValorantCheckerApp:
             "extension_path": self.extension_var.get(),
             "output_dir": self.output_var.get(),
             "concurrency": int(self.concurrency_var.get()),
+            "nopecha_api_key": self.nopecha_var.get(),
+            "gologin_token": self.gologin_token_var.get(),
         }
         temp_path = SETTINGS_PATH.with_suffix(".tmp")
         temp_path.write_text(json.dumps(value, indent=2), encoding="utf-8")
@@ -360,8 +366,8 @@ class ValorantCheckerApp:
         self._path_row(config_inner, 0, 0, "Accounts TXT", self.accounts_var, self.choose_accounts, self.accounts_count_var)
         self._path_row(config_inner, 1, 0, "Proxies TXT", self.proxies_var, self.choose_proxies, self.proxies_count_var)
         self._path_row(config_inner, 0, 3, "Orbita chrome.exe", self.browser_var, self.choose_browser)
+        self._path_row(config_inner, 3, 3, "NopeCHA extension", self.extension_var, self.choose_extension)
         self._path_row(config_inner, 1, 3, "Thư mục output", self.output_var, self.choose_output)
-        self._path_row(config_inner, 2, 3, "OMO extension", self.extension_var, self.choose_extension)
 
         self._tk_label(config_inner, "Concurrency", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 9)).grid(
             row=2, column=0, sticky="w", pady=(12, 0), padx=(0, 10)
@@ -381,8 +387,20 @@ class ValorantCheckerApp:
         ).pack(side="left", padx=6)
         self._button(conc_row, "+", lambda: self._change_concurrency(1), "secondary", width=3).pack(side="left")
 
+        self._tk_label(config_inner, "GoLogin Token", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 9)).grid(
+            row=3, column=0, sticky="w", pady=(12, 0), padx=(0, 10)
+        )
+        gologin_entry = self._entry(config_inner, self.gologin_token_var)
+        gologin_entry.grid(row=3, column=1, sticky="ew", pady=(12, 0))
+
+        self._tk_label(config_inner, "NopeCHA Key", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 9)).grid(
+            row=2, column=3, sticky="w", pady=(12, 0), padx=(0, 10)
+        )
+        nopecha_entry = self._entry(config_inner, self.nopecha_var)
+        nopecha_entry.grid(row=2, column=4, columnspan=2, sticky="ew", pady=(12, 0))
+
         controls = tk.Frame(config_inner, bg=CARD)
-        controls.grid(row=3, column=3, columnspan=3, sticky="e", pady=(12, 0))
+        controls.grid(row=4, column=3, columnspan=3, sticky="e", pady=(12, 0))
         self.start_button = self._button(controls, "Bắt đầu", self.start_run, "success", width=12)
         self.start_button.pack(side="left")
         self.proxy_button = self._button(controls, "Check Proxy", self.start_proxy_check, "primary", width=12)
@@ -664,7 +682,7 @@ class ValorantCheckerApp:
             self.browser_var.set(path)
 
     def choose_extension(self) -> None:
-        path = filedialog.askdirectory(title="Chọn thư mục extension có manifest.json")
+        path = filedialog.askdirectory(title="Chon thu muc extension co manifest.json")
         if path:
             self.extension_var.set(path)
 
@@ -704,7 +722,7 @@ class ValorantCheckerApp:
             if not extension_path.is_dir() or not (extension_path / "manifest.json").is_file():
                 messagebox.showwarning(
                     "Sai extension",
-                    "Hãy chọn thư mục extension đã giải nén và có file manifest.json.",
+                    "Hay chon thu muc extension da giai nen va co file manifest.json.",
                 )
                 return False
         if self.proxies_var.get() and not Path(self.proxies_var.get()).is_file():
@@ -741,6 +759,8 @@ class ValorantCheckerApp:
             return
 
         self._save_settings()
+        os.environ["NOPECHA_API_KEY"] = self.nopecha_var.get()
+        os.environ["GOLOGIN_TOKEN"] = self.gologin_token_var.get()
         self.cancel_event = threading.Event()
         self.report_path = None
         self._set_progress(0)
