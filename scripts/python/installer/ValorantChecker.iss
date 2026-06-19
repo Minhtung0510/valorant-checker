@@ -14,20 +14,22 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=output
 OutputBaseFilename=ValorantCheckerSetup
+SetupIconFile=..\assets\app-mark.ico
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
-UninstallDisplayIcon={app}\{#AppExeName}
+UninstallDisplayIcon={app}\app-mark.ico
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
 [Files]
+Source: "..\assets\app-mark.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist-package\ValorantChecker\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#OrbitaSource}\*"; DestDir: "{app}\browser\orbita-browser-145"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\app-mark.ico"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\app-mark.ico"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
